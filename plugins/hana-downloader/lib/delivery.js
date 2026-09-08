@@ -1,24 +1,26 @@
-// lib/delivery.js — hana-downloader 投递层唯一权威（v0.11.0）
+// lib/delivery.js — hana-downloader 投递层唯一权威（v0.14.0 真同步注入恢复）
 //
-// 设计：
-//   - 未收束会话：终态进入 pending 队列，由 extensions/dl-nextturn.js 的
-//     before_provider_request 在“下一条 LLM API 请求”里拼入 hana-background-result。
-//   - 已收束会话：直接 deferred:resolve 异步唤醒。
-//   - agent 取消：静默（download-cancel 同步返回值就是结果）。
-//   - user 取消：异步通知（带 canceledBy=user + hint）。
+// 设计（v0.14.0，宿主 0.928.0）：
+//   - 未收束会话（agent 正处于流式回复中，当前 turn 未结束）：
+//     终态 / stall 进入 pending 队列 → 宿主下一次 agent/pre-step 决策时（即下一条 LLM API
+//     请求组装前）把 hana-background-result 拼进该请求的 messages → agent 在不收束会话的
+//     前提下，下一次思考即感知下载完成。这就是「同步投递」。
+//   - 已收束会话：直接 deferred:register + deferred:resolve，宿主 dispatcher 毫秒级接管
+//     （agent busy → followUp 排队；agent idle → triggerTurn 唤醒新 turn）。
+//   - 超时兜底：pending 在 SYNC_WAIT_MS 内未被任何 agent/pre-step 消费 → 降级 deferred，
+//     保证不丢回执；若 bundle 魔改暴露了 isSessionActive 且会话仍活跃，则续等（上限 10 分钟）。
+//   - agent 取消（canceledBy=agent）：静默（download-cancel 同步返回值就是结果）。
+//   - user 取消（canceledBy=user）：异步通知（带 hint）。
 //   - 每任务只允许一条回执：内存 _delivered + 持久化 delivered 双重去重。
 //
-// 本模块由 index.js 在插件 onload 时创建一次，并订阅 mgr.onFinal/onStall。
-// extensions/dl-nextturn.js 只负责把 pending 队列注入当前会话的 provider request。
+// 注入通道由 index.js 在 onload 时注册（优先 v2 ctx.hooks 正门，退 globalThis.__sessionHooks
+// 魔改通道）；本模块只负责 pending 队列的入队与消费。
 
 import fs from "node:fs";
-import { getBus, registerDeferred } from "./deferred.js";
-import { completeTask, failTask, cancelTask } from "./registry.js";
 
 const TERMINAL = new Set(["done", "failed", "canceled", "interrupted"]);
-const SYNC_WAIT_MS = 30000; // 等待下一条 provider request 的时间，超时降级异步。
-// 之前 2500 偏短：agent settle 后要思考 2-3 秒才发下一条 LLM 调用，timer 提前清空 pending → injectForSession 永远拿不到数据。
-// 改 30 秒覆盖典型 agent reasoning + tool loop 周期。
+const SYNC_WAIT_MS = 30000; // 等下一条 provider request 的时间，超时降级异步
+const SYNC_MAX_WAIT_MS = 10 * 60 * 1000; // 续等总上限：防悬挂工具永不出结果
 
 function statusOf(task) {
   return task ? (task.state || task.status || "") : "";
@@ -28,6 +30,8 @@ function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+// 会话是否已收束：jsonl 尾部最近一条 assistant message 的 stopReason==="stop" 才算收束。
+// 注意必须看「最近的 assistant」——倒序第一个 assistant 若是 toolUse 状态，说明 agent 还在回合中。
 function tailSettled(sessionPath) {
   try {
     if (!sessionPath || !fs.existsSync(sessionPath)) return false;
@@ -43,13 +47,7 @@ function tailSettled(sessionPath) {
       try { o = JSON.parse(lines[i]); } catch { continue; }
       if (o.type !== "message" || !o.message) continue;
       const m = o.message;
-      if (m.role === "assistant") {
-        // 只看最近的 assistant message：stopReason="stop" 才算当前回合已收束。
-        // 之前 bug：倒序找到第一个 assistant+stop 就返回 true，忽略更新的 assistant（toolUse 状态），
-        // 导致 agent 保持回合（最近的 assistant 是 toolUse）时误判为已收束 → handleFinal 走 deliverAsync 异步 → 不入 pending → injectForSession 拿不到数据。
-        return m.stopReason === "stop";
-      }
-      // toolResult/user message 跳过，继续往上找最近的 assistant
+      if (m.role === "assistant") return m.stopReason === "stop";
     }
     return false;
   } catch {
@@ -57,48 +55,36 @@ function tailSettled(sessionPath) {
   }
 }
 
-export function createDelivery({ bus, manager, dataDir, log }) {
-  const logger = log || { info() {}, warn() {}, error() {} };
-  const pending = new Map(); // taskId -> { task, result, entry, timer, sessionPath }
+/**
+ * 构造投递实例（同步注入 + deferred 兜底）。
+ * @param {object} opts
+ * @param {object} opts.ctx   v2 plugin ctx（含 bus, log, dataDir, pluginId, hooks）
+ * @param {object} opts.bus   v2 plugin ctx.bus（自动注入 caller）
+ * @param {object} opts.manager TaskManager 单例
+ * @param {string} opts.dataDir 插件数据目录
+ * @param {object} opts.log  日志对象
+ */
+export function createDelivery({ ctx, bus, manager, dataDir, log }) {
+  const logger = log || ctx?.log || { info() {}, warn() {}, error() {} };
+  function logInfo(s) { try { logger.info?.(s); } catch {} }
+  function logWarn(s) { try { logger.warn?.(s); } catch {} }
 
-  function logInfo(s) {
-    try { logger.info?.(s); } catch {}
-  }
+  const PLUGIN_ID = ctx?.pluginId || "hana-downloader";
+  const pending = new Map(); // key -> { task, result, entry, timer, sessionPath, waitTotal, kind }
 
-  function alreadyHandled(t) {
-    return t && (t._delivered === true || t.delivered === true);
-  }
-
-  function markDelivered(t) {
-    if (!t) return;
-    if (manager.markDelivered) { try { manager.markDelivered(t.taskId); } catch {} }
-    t._delivered = true;
-    t.delivered = true;
-  }
-
-  function finalizeRegistry(t) {
-    if (!t || t._registryFinalized) return;
-    t._registryFinalized = true;
-    const b = getBus(undefined);
-    if (!b) return;
-    const state = statusOf(t);
-    if (state === "done") {
-      completeTask(b, t.taskId, {
-        url: t.url || "", fileName: t.fileName || "", filePath: t.filePath || null,
-        total: t.total ?? null, received: t.received ?? 0,
-      }).catch(() => {});
-    } else if (state === "canceled") {
-      cancelTask(b, t.taskId, { state, error: t.error || state, canceledBy: t.canceledBy || null }).catch(() => {});
-    } else {
-      failTask(b, t.taskId, { state, error: t.error || state, canceledBy: t.canceledBy || null }).catch(() => {});
-    }
-  }
-
+  // ── 终态结果构造 ──
   function buildResult(task) {
     const state = statusOf(task);
     const status = state === "done" ? "done" : state === "canceled" ? "cancelled" : "error";
     if (state === "done") {
-      return { taskId: task.taskId, fileName: task.fileName || "", status, filePath: task.filePath, total: task.total ?? null, received: task.received ?? 0 };
+      return {
+        taskId: task.taskId,
+        fileName: task.fileName || "",
+        status,
+        filePath: task.filePath,
+        total: task.total ?? null,
+        received: task.received ?? 0,
+      };
     }
     const userCanceled = state === "canceled" && task.canceledBy === "user";
     return {
@@ -111,11 +97,10 @@ export function createDelivery({ bus, manager, dataDir, log }) {
     };
   }
 
+  // hana-background-result 消息体。双 status 字段：
+  //   status（legacyStatus）= success/failed/aborted，宿主 interlude / 前端 detail 兼容
+  //   event-status（新语义）= done/cancelled/error，agent 应读这个
   function buildEntry(taskId, result) {
-    // 双 status 字段：
-    //   status（legacyStatus）= success/failed/aborted，宿主 interlude / 前端 detail 兼容
-    //   event-status（新语义）= done/cancelled/error，agent 应该看这个
-    // 用 result.status 新语义算 eventStatus；fallback 到 result.state
     const eventStatus = result.status || (result.state === "done" ? "done" : result.state === "canceled" ? "cancelled" : "error");
     const legacyStatus = eventStatus === "done" ? "success" : eventStatus === "cancelled" ? "aborted" : "failed";
     const action = eventStatus === "done" || eventStatus === "cancelled" ? "none" : "decide";
@@ -128,29 +113,94 @@ export function createDelivery({ bus, manager, dataDir, log }) {
     };
   }
 
+  function alreadyHandled(t) {
+    return t && (t._delivered === true || t.delivered === true);
+  }
+
+  function markDelivered(t) {
+    if (!t) return;
+    if (manager.markDelivered) {
+      try { manager.markDelivered(t.taskId); } catch {}
+    }
+    t._delivered = true;
+    t.delivered = true;
+  }
+
+  function finalizeRegistry(t) {
+    if (!t || t._registryFinalized) return;
+    t._registryFinalized = true;
+    if (!bus) return;
+    const state = statusOf(t);
+    import("./registry.js").then(({ completeTask, failTask, cancelTask }) => {
+      if (state === "done") {
+        completeTask(bus, t.taskId, {
+          url: t.url || "",
+          fileName: t.fileName || "",
+          filePath: t.filePath || null,
+          total: t.total ?? null,
+          received: t.received ?? 0,
+        }).catch(() => {});
+      } else if (state === "canceled") {
+        cancelTask(bus, t.taskId, {
+          state,
+          error: t.error || state,
+          canceledBy: t.canceledBy || null,
+        }).catch(() => {});
+      } else {
+        failTask(bus, t.taskId, {
+          state,
+          error: t.error || state,
+          canceledBy: t.canceledBy || null,
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+  }
+
+  // ── 异步投递（已收束会话 / 同步超时兜底）──
   async function deliverAsync(t, result) {
-    const b = getBus(undefined);
-    if (!b) {
-      logInfo(`[delivery] NO BUS for ${t.taskId} deferred`);
+    if (!bus) {
+      logWarn(`[delivery] NO BUS for ${t.taskId} async`);
       markDelivered(t);
       finalizeRegistry(t);
       return;
     }
     try {
       if (t.deferredRegistered !== true) {
-        await registerDeferred(b, t, {}, null, null).catch(() => {});
+        await import("./deferred.js").then(({ registerDeferred }) =>
+          registerDeferred(bus, t, {}, null, null)
+        ).catch(() => {});
       }
-      await b.request("deferred:resolve", { taskId: t.taskId, result });
+      await bus.request("deferred:resolve", { taskId: t.taskId, result });
       markDelivered(t);
       finalizeRegistry(t);
       logInfo(`[delivery] ASYNC ${t.taskId} (${statusOf(t)}) → deferred:resolve`);
     } catch (e) {
-      logInfo(`[delivery] ASYNC ERR ${t.taskId}: ${e?.message || e}`);
+      logWarn(`[delivery] ASYNC ERR ${t.taskId}: ${e?.message || e}`);
     }
   }
 
-  // agent 是否还在 streaming（跑长任务/工具挂起）。bundle 魔改暴露 __sessionHooks.isSessionActive；
-  // 未魔改时返回 null（调方按不可判决处理，保留原超时兜底）。
+  // ── stall 异步投递兜底 ──
+  async function deliverStallAsync(t, result, stallKey) {
+    if (!bus || !t || !stallKey) {
+      if (t) t._stallDelivered = true;
+      return;
+    }
+    try {
+      await bus.request("deferred:register", {
+        taskId: stallKey,
+        ...(t.sessionId ? { sessionId: t.sessionId } : {}),
+        ...(t.sessionPath ? { sessionPath: t.sessionPath } : {}),
+        meta: { type: "download-stall", fileName: t.fileName || "", url: t.url || "" },
+      }).catch(() => {});
+      await bus.request("deferred:resolve", { taskId: stallKey, result });
+      t._stallDelivered = true;
+      logInfo(`[delivery] STALL-ASYNC ${t.taskId} (${stallKey}) → deferred:resolve`);
+    } catch (e) {
+      logWarn(`[delivery] STALL-ASYNC ERR ${t.taskId}: ${e?.message || e}`);
+    }
+  }
+
+  // ── 会话实时态（仅 bundle 魔改暴露时可用；返回 null = 不可判）──
   function sessionActive(sessionPath) {
     try {
       const fn = globalThis.__sessionHooks?.isSessionActive;
@@ -159,8 +209,7 @@ export function createDelivery({ bus, manager, dataDir, log }) {
     } catch { return null; }
   }
 
-  const SYNC_MAX_WAIT_MS = 10 * 60 * 1000; // 续等总上限：长任务最多续 10 分钟，防悬挂工具永不出结果
-
+  // ── 同步注入入队：等下一条 agent/pre-step 消费 ──
   function enqueueSync(t, entry, keyOverride = null, kind = "final") {
     const key = keyOverride || t.taskId;
     const item = {
@@ -172,21 +221,19 @@ export function createDelivery({ bus, manager, dataDir, log }) {
       waitTotal: 0,
       kind,
     };
-    // 入队即置位（而非等到注入/超时才置）：
-    // 同一 manager 单例上若残留多个 onStall/onFinal 订阅（dev 槽重载未退订），
-    // 并发回调对同一任务会各入队一个 pending → 双 stallKey/双投。
-    // 入队瞬间抢占旗标，后续订阅直接跳过。
+    // 入队即置位：同一 manager 单例若残留多个订阅（dev 槽重载未退订），
+    // 并发回调会对同一任务各入队一份 → 双投。
     if (kind === "stall") {
       if (t) t._stallDelivered = true;
     } else if (t) {
       t._delivered = true;
     }
     pending.set(key, item);
+    logInfo(`[delivery] SYNC-ENQUEUE ${key} (${kind}) session=${item.sessionPath || "?"} → wait agent/pre-step`);
+
     const schedule = (ms) => {
       item.timer = setTimeout(() => {
         if (pending.get(key) !== item) return;
-        // 实时态判断：agent 还在 streaming（长任务/工具挂起）→ 续等，不强推;
-        // 已收束（不活跃）→ 立即兜底异步投递。
         const active = sessionActive(item.sessionPath);
         if (active === true && item.waitTotal < SYNC_MAX_WAIT_MS) {
           item.waitTotal += ms;
@@ -195,11 +242,11 @@ export function createDelivery({ bus, manager, dataDir, log }) {
           return;
         }
         pending.delete(key);
-        logInfo(`[delivery] SYNC TIMEOUT ${key} (${kind}) → fallback`);
+        logInfo(`[delivery] SYNC-TIMEOUT ${key} (${kind}) → fallback async`);
         if (kind === "stall") {
-          t._stallDelivered = true;
+          deliverStallAsync(item.task, item.result, key).catch(() => {});
         } else {
-          deliverAsync(t, item.result).catch(() => {});
+          deliverAsync(item.task, item.result).catch(() => {});
         }
       }, ms);
       if (item.timer.unref) item.timer.unref();
@@ -207,105 +254,14 @@ export function createDelivery({ bus, manager, dataDir, log }) {
     schedule(SYNC_WAIT_MS);
   }
 
-  async function handleFinal(task) {
-    if (!task) return;
-    const taskId = task.taskId;
-    const state = statusOf(task);
-    if (!TERMINAL.has(state)) return;
-    const t = manager.getTask ? (manager.getTask(taskId) || task) : task;
-    if (!t) return;
-
-    if (alreadyHandled(t)) {
-      logInfo(`[delivery] skip ${taskId}: already delivered`);
-      return;
-    }
-
-    // stall 已投递过：任务停滞已通知 agent（“下载连接已停滞”）。
-    // 仅抑制被动终态（done/error/interrupted——是停滞的后果，agent 已知，不重复投递）。
-    // 例外：user 手动取消（canceledBy=user）是外界主动干预，agent 需要知道“用户打断了下载”，
-    // 必须恢复通知（否则 agent 不知道发生了什么）。
-    // 仅抑制已成功投递过的 stall（_stallDelivered=true）；stall 通知未投递成功（超时降级未消费）时终态仍需投递兜底。
-    if ((t._stallDelivered === true || t.stallNotified === true) && t.canceledBy !== "user") {
-      logInfo(`[delivery] skip ${taskId}: stall already delivered`);
-      return;
-    }
-
-    if (t.consumedByWait === true || (t.waitActive || 0) > 0) {
-      markDelivered(t);
-      finalizeRegistry(t);
-      logInfo(`[delivery] skip ${taskId}: consumedByWait`);
-      return;
-    }
-
-    if (state === "canceled" && t.canceledBy === "agent") {
-      markDelivered(t);
-      finalizeRegistry(t);
-      logInfo(`[delivery] skip ${taskId}: canceled-by-agent → silent`);
-      return;
-    }
-
-    const result = buildResult(t);
-    const entry = buildEntry(taskId, result);
-    entry._result = result;
-
-    // 已收束 → 直接异步
-    if (tailSettled(t.sessionPath || t.sessionRef?.path)) {
-      logInfo(`[delivery] settled ${taskId} → async deferred`);
-      deliverAsync(t, result).catch(() => {});
-      return;
-    }
-
-    // 未收束 → 入队等待 before_provider_request 注入。
-    // 关键：入队前立即置位 _stallDelivered/_delivered，防止并发/重复订阅
-    // （dev 槽重载残留）对同一 stall 事件二次入队 → 双 stallKey 双投。
-    logInfo(`[delivery] unsettled ${taskId} → enqueue sync injection`);
-    enqueueSync(t, entry);
-  }
-
-  async function handleStall(task) {
-    if (!task || !task.taskId) return;
-    const taskId = task.taskId;
-    const t = manager.getTask ? (manager.getTask(taskId) || task) : task;
-    if (!t) return;
-    if (t._stallDelivered) return;
-    if (t.consumedByWait === true || (t.waitActive || 0) > 0) return;
-
-    const stallKey = taskId + ":stall:" + Date.now();
-    const result = {
-      taskId,
-      fileName: t.fileName || "",
-      url: t.url || "",
-      status: "stall",
-      hint: "下载连接已停滞，以最新 download-wait / done 通知为准",
-    };
-    const entry = buildEntry(stallKey, result);
-    entry._result = result;
-
-    if (tailSettled(t.sessionPath || t.sessionRef?.path)) {
-      const b = getBus(undefined);
-      if (!b) return;
-      b.request("deferred:register", {
-        taskId: stallKey,
-        ...(t.sessionId ? { sessionId: t.sessionId } : {}),
-        ...(t.sessionPath ? { sessionPath: t.sessionPath } : {}),
-        meta: { type: "download-stall", fileName: t.fileName || "", url: t.url || "" },
-      }).catch(() => {});
-      b.request("deferred:resolve", { taskId: stallKey, result }).catch(() => {});
-      t._stallDelivered = true;
-      return;
-    }
-
-    enqueueSync(t, entry, stallKey, "stall");
-  }
-
-  // 供 extension 调用：把当前会话 pending 的消息注入 provider payload
+  // ── 供 index.js 的 agent/pre-step adjudicator 调用：把本会话 pending 拼进下一条请求 ──
   function injectForSession(sessionPath, payload) {
     if (!payload || !Array.isArray(payload.messages) || pending.size === 0) return payload;
     const injected = [];
     for (const [key, item] of Array.from(pending)) {
       const itemSession = item.sessionPath || item.task?.sessionPath || item.task?.sessionRef?.path;
       if (sessionPath && itemSession && !sameSession(sessionPath, itemSession)) continue;
-      clearTimeout(item.timer);
+      if (item.timer) clearTimeout(item.timer);
       pending.delete(key);
       payload.messages.push({
         role: "user",
@@ -321,7 +277,7 @@ export function createDelivery({ bus, manager, dataDir, log }) {
       }
       injected.push(key);
     }
-    if (injected.length) logInfo(`[delivery] INJECT ${injected.join(",")} into next provider request`);
+    if (injected.length) logInfo(`[delivery] SYNC-INJECT ${injected.join(",")} into next provider request`);
     return payload;
   }
 
@@ -331,11 +287,77 @@ export function createDelivery({ bus, manager, dataDir, log }) {
     return !na || !nb || na === nb;
   }
 
-  // 订阅 dlcore 终态/停滞（唯一权威，index.js 创建一次）
-  // onFinal 是覆盖式单订阅（dlcore 内 _finalCb 直接替换），重复 onload 天然只留一份；
-  // onStall 是多订阅数组，必须保存退订函数供 dispose 使用——
-  // dev 槽重载/插件卸载时若不退订，旧回调残留在同一 manager 单例上，
-  // 一个 stall 事件会被多个 delivery 实例各投一次（双投 bug 实测 2026-09-01）。
+  // ── 终态回调（订阅 mgr.onFinal）──
+  async function handleFinal(task) {
+    if (!task) return;
+    const taskId = task.taskId;
+    const state = statusOf(task);
+    if (!TERMINAL.has(state)) return;
+    const t = manager.getTask ? (manager.getTask(taskId) || task) : task;
+    if (!t) return;
+    if (alreadyHandled(t)) {
+      logInfo(`[delivery] skip ${taskId}: already delivered`);
+      return;
+    }
+    if (t.consumedByWait === true || (t.waitActive || 0) > 0) {
+      markDelivered(t);
+      finalizeRegistry(t);
+      logInfo(`[delivery] skip ${taskId}: consumedByWait`);
+      return;
+    }
+    if (state === "canceled" && t.canceledBy === "agent") {
+      markDelivered(t);
+      finalizeRegistry(t);
+      logInfo(`[delivery] skip ${taskId}: canceled-by-agent → silent`);
+      return;
+    }
+
+    const result = buildResult(t);
+    const entry = buildEntry(taskId, result);
+    entry._result = result;
+    const sp = t.sessionPath || t.sessionRef?.path || null;
+
+    // 已收束 → 直接异步唤醒
+    if (tailSettled(sp)) {
+      logInfo(`[delivery] settled ${taskId} → async deferred`);
+      await deliverAsync(t, result);
+      return;
+    }
+    // 未收束 → 入队等下一条 API 请求（真同步）
+    enqueueSync(t, entry);
+  }
+
+  // ── 停滞回调（订阅 mgr.onStall）──
+  async function handleStall(task) {
+    if (!task || !task.taskId) return;
+    const taskId = task.taskId;
+    const t = manager.getTask ? (manager.getTask(taskId) || task) : task;
+    if (!t) return;
+    // 终态任务不发停滞通知（done/canceled 后排队补发的 stall 全是噪音）
+    if (TERMINAL.has(statusOf(t))) return;
+    if (t._stallDelivered) return;
+    if (t.consumedByWait === true || (t.waitActive || 0) > 0) return;
+
+    const stallKey = taskId + ":stall:" + Date.now();
+    const result = {
+      taskId,
+      fileName: t.fileName || "",
+      url: t.url || "",
+      status: "stall",
+      hint: "下载连接已停滞，以最新 download-wait / done 通知为准",
+    };
+    const entry = buildEntry(stallKey, result);
+    entry._result = result;
+    const sp = t.sessionPath || t.sessionRef?.path || null;
+
+    if (tailSettled(sp)) {
+      await deliverStallAsync(t, result, stallKey);
+      return;
+    }
+    enqueueSync(t, entry, stallKey, "stall");
+  }
+
+  // ── 订阅 dlcore 终态/停滞（唯一权威，index.js 创建一次）──
   const unsubStall = typeof manager.onStall === "function"
     ? manager.onStall((task) => { handleStall(task || null).catch(() => {}); })
     : null;
@@ -343,8 +365,11 @@ export function createDelivery({ bus, manager, dataDir, log }) {
     manager.onFinal((task) => { handleFinal(task || null).catch(() => {}); });
   }
 
-  // 释放本实例对 manager 的订阅（index.js 重载/dev 槽切换前调用）
   function dispose() {
+    for (const [key, item] of Array.from(pending)) {
+      if (item.timer) { try { clearTimeout(item.timer); } catch {} }
+      pending.delete(key);
+    }
     if (typeof unsubStall === "function") {
       try { unsubStall(); } catch {}
     }

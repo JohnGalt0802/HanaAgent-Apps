@@ -9,8 +9,7 @@ import { getTaskManager } from "../lib/dlcore.js";
 
 export const name = "download-wait";
 export const description =
-  "查询下载进度（与 download-file 配对），立即返回当前事实快照不等待。\n" +
-  "可选回查：任务未完成时可直接收束，下载完成会自动唤醒；若想主动确认进度或提前拿终态，可调用本工具。";
+  "查询一个下载任务的当前进度快照（state/进度/速度/剩余时间）。立即返回、不阻塞、不等待下载完成。用于主动确认进度或提前拿终态；不调用也能正常收到完成通知。\n返回当前事实即可，无需解释。";
 
 // 查询只读，不产生外部副作用 → kind:"read"
 export const sessionPermission = { kind: "read" };

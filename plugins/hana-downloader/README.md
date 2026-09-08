@@ -4,9 +4,9 @@
 > 下载任务实时可视化、进度状态可查询、中途可干预、终态可靠通知。
 > 同时提供命令型下载（git clone / pnpm install）与跨会话下载管理器。
 
-- 当前版本：v0.11.0
+- 当前版本：v0.14.0
 - 权限要求：full-access
-- 运行环境：HanaAgent ≥ 0.810.0（推荐 0.814.0，需 host bundle 魔改）
+- 运行环境：HanaAgent 0.928.0（实测基线；同步投递需 host bundle 魔改，已脚本化自动重建）
 
 ---
 
@@ -37,28 +37,31 @@
 - 数据层 → 工具层：`onceFinal(taskId)` 提供终态一次性等待原语；`onFinal/onStall` 回调驱动投递分流。
 - 工具层 → 宿主：`deferred:register/resolve` 总线通道承载跨回合投递。
 
-## 二、核心机制：v0.11.0 三通道通知
+## 二、核心机制：v0.14.0 双通道通知
 
-下载完成通知按 agent 当前状态分三条：
+下载完成通知按 agent 当前状态分两条：
 
 | agent 状态 | 投递路径 | agent 感知时机 |
 |---|---|---|
-| 未收束 | **真同步**：bundle 魔改暴露 `__sessionHooks`，插件注册 `agent/pre-step` adjudicator（order 999），HBR 推 `payload.messages` | **当前轮** LLM API messages 看到 HBR |
-| 未收束但 agent 做长任务（>30s 无 API）| **主动投递**：enqueueSync 超时用 session 实时态判断（`isSessionActive`），agent 活跃则 RESCHEDULE 续等，agent 发 API 时注入 | agent 后续 API 调用注入 |
-| 已收束 | 异步 triggerTurn：host `deliverCustomMessage` → triggerTurn 立即开新 turn | 新 turn input 看到 HBR |
+| 未收束 | **真同步**：注册 `agent/pre-step` adjudicator（order 999），把 HBR 拼进**下一条 LLM API 请求的 messages**（需 bundle 魔改暴露 hooks registry） | **当前轮** 下一次思考即看到 HBR |
+| 未收束但 agent 做长任务（>30s 无 API）| **续等**：pending 30s 未被消费时用 `isSessionActive` 判 session 实时态，活跃则 RESCHEDULE，agent 发 API 时注入（上限 10min） | agent 后续 API 调用注入 |
+| 已收束 | **异步唤醒**：`deferred:register + resolve` → host dispatcher（busy→followUp，idle→triggerTurn） | 新 turn input 看到 HBR |
 
-完整机制见 `docs/v0.11.0-真同步投递完整机制.md`（HBR 7 属性 / 4 commit 修复链 / 主动投递 / 三种时机表）。
+同步超时（30s 且无法判定活跃）→ 自动降级异步，不丢回执。
+
+完整机制见 `docs/host-changelog/v0.14.0-sync-restore.md`（四场景实测 + 证据）；历史链路见 `docs/v0.11.0-真同步投递完整机制.md`。
 
 ### 真同步部署前置（必要）
 
-宿主 bundle 魔改一行暴露 hooks registry：
+宿主 bundle 需魔改一行暴露 hooks registry（锚点随宿主版本变，用脚本自动定位）：
 
 ```js
-// bundle/index.js:171120
-globalThis.__sessionHooks = j;
+// 紧跟 `const se = t.sessionHooks ?? oot();`（0.928.0）
+globalThis.__sessionHooks = se;
+globalThis.__hanaEngine = O;
 ```
 
-宿主升级后必须重做魔改（升级前备份 bundle/index.js 到本地临时目录）。未魔改时 plugin 静默降级为纯异步 triggerTurn 路径。
+宿主升级会覆盖 bundle，魔改随之丢失。现在由 `<workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1` 自动重建（已挂进 `restart-hana-reliable.ps1`，重启前自动执行）。魔改缺失时插件静默降级为「收束后 deferred 唤醒」，不丢回执但失去同步语义。
 
 ### HBR 根标签 7 属性
 
@@ -111,7 +114,9 @@ globalThis.__sessionHooks = j;
 
 ### 3.5 跨会话管理器
 
-`/manager` 页面集中展示所有会话的下载任务：列表、筛选（全部/在途/已完成/失败）、搜索、行内详情、打开文件/所在文件夹、默认下载目录设置。样式自包含浅/深双色板并跟随宿主主题广播切换。
+`/manager` 页面集中展示所有会话的下载任务：列表、筛选（全部/在途/已完成/失败）、搜索、行内详情、打开文件/所在文件夹、默认下载目录设置。
+
+布局与配色（v0.14.0）：卡片底色与滚动条优先取宿主注入的 CSS 变量（`--bg-card` / `--text-muted`），未注入时退回自包含双色板；列表用 flex 高度链（`#dl-root` 列布局 + `.mgr-list` `flex:1 / min-height:0 / overflow-y:auto`）在视口内滚动，不再依赖宿主卡片高度上限的硬编码值。
 
 ## 四、设置项
 
@@ -137,28 +142,33 @@ tools/download-cancel.js     取消工具
 routes/download.js           卡片页/管理器页/status/list/cancel/prepare/reveal/settings 路由
 app/card.css|card.js         进度卡片前端（自包含色板、折叠交互、报高）
 app/manager.css|manager.js   跨会话管理器前端
-docs/v0.11.0-真同步投递完整机制.md   完整机制文档（落地）
+docs/host-changelog/v0.14.0-sync-restore.md  当前机制与实测（权威）
+docs/card-width-and-container.md   聊天流卡片宽度与容器约束（实测）
+docs/host-bundle-mods.md      宿主魔改重建手册（内部，含本机路径，不入公开库）
+docs/v0.11.0-真同步投递完整机制.md   历史机制文档（v1 契约时代）
 ```
 
 ---
 
-## 六、宿主魔改部署步骤
+## 六、宿主魔改部署步骤（v0.14.0 起脚本化）
 
 ```powershell
-# 1. 备份 bundle（重做魔改前恢复）
-$bundle = "$env:USERPROFILE\.hanako\artifacts\server\0.814.0-win32-x64\bundle\index.js"
-Copy-Item $bundle "$env:TEMP\bundle-index.js.魔改前.bak" -Force
+# 脚本放在你的工作区 _tools 下；路径按实际位置替换
+# 自动：定位当前 bundle → 检测 marker → 打补丁 → 自动备份 → 校验
+pwsh -NoProfile -File <workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1
 
-# 2. 在 bundle/index.js 第 171120 行附近加一行：
-#    globalThis.__sessionHooks = j;
-#    （plugin index.js onload 通过 globalThis.__sessionHooks 注册 adjudicator）
+# 预演（不写盘）
+pwsh -NoProfile -File <workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1 -DryRun
 
-# 3. 重启宿主
-pwsh -File <你的重启脚本路径>\restart-hana-reliable.ps1
+# 重启宿主（脚本内已含魔改检查，一般不必单独跑）
+pwsh -File <workspace>\_tools\restart-hana\restart-hana-reliable.ps1
 ```
 
+脚本会幂等处理：已打则报 `OK: 魔改已在位`；锚点结构变了会报 `ERR: 未找到 sessionHooks 锚点`，需人工介入（见 `docs/host-bundle-mods.md` §5）。
+
 **调试日志**（运行时写，不影响功能）：
-- 插件数据目录 `stall-debug.log`：onload / adjudicator called / injected 计数
+- 插件数据目录 `v2-load-debug.log`：onload / hooks probe / adjudicator called / **INJECTED**（v0.14.0 起同步投递的判据）
+- 插件数据目录 `stall-debug.log`：历史日志（v0.13 及之前）
 
 ---
 

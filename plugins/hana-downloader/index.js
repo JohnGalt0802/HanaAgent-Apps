@@ -1,87 +1,166 @@
-// index.js — hana-downloader v0.11.0 v1 插件生命周期
+// index.js — hana-downloader v0.14.0 v2 plugin lifecycle（零依赖版）
 //
-// 投递架构（v0.11.0 重做）：
-//   - lib/delivery.js 是唯一投递权威：订阅 mgr.onFinal/onStall，
-//     未收束 → pending 队列等待 before_provider_request 注入；
-//     已收束 → deferred:resolve 异步唤醒。
-//   - extensions/dl-nextturn.js 只负责把当前会话 pending 的下载结果
-//     拼进下一条 LLM API 请求（before_provider_request）。
+// 投递架构（v0.14.0，宿主 0.928.0）：
+//   - lib/delivery.js 是唯一投递权威：订阅 mgr.onFinal/onStall。
+//   - 真同步注入：onload 注册 agent/pre-step adjudicator，宿主在下一条 LLM API 请求组装前
+//     dispatch，我们把 pending 里的 hana-background-result 拼进 messages → 未收束会话
+//     的 agent 下一次思考即感知（不打断当前流式回复）。
+//     通道优先级：v2 ctx.hooks（宿主原生正门，抗宿主更新）→ globalThis.__sessionHooks（bundle 魔改通道）。
+//   - 已收束会话：deferred:register + deferred:resolve，宿主 dispatcher 接管（followUp/triggerTurn）。
+//   - session:send 通道已废弃（0.928.0 下 agent 活跃期恒 session_busy；v2 app steer 被归属校验封死）。
 //
-// 本文件保留 v1 插件入口：onload 构建 TaskManager、注册 abort handler、
-// 初始化 delivery，并把 bus/manager 挂到 globalThis 供工具与扩展使用。
+// v2 plugin 协议（manifestVersion=2）：
+//   - entry 字段入口（不是顶层 tools/cards/routes）。
+//   - host 调 `new a()` + `c.ctx = e.ctx` + `c.register = (l) => {...}` + `c.onload()`。
+//   - 不依赖任何外部包（host 不在 community 槽自动安装 node_modules）。
+//   - ctx.bus 自动注入 caller: {kind: "plugin", pluginId}（bc() 在 host 视为 null）。
+//   - 工具 (tools/) + 路由 (routes/) + 命令 (commands/) + 扩展 (extensions/) 由 host 自动加载。
 import { getTaskManager } from "./lib/dlcore.js";
-import { registerHandler } from "./lib/registry.js";
 import { createDelivery } from "./lib/delivery.js";
-import fs from "node:fs";
-import path from "node:path";
+import { registerHandler } from "./lib/registry.js";
 
-export default class DownloadProgressPlugin {
-  onload() {
-    const { dataDir, bus, log } = this.ctx;
-    // 诊断日志：写在插件数据目录下（不硬编码本机路径），确认 onload 执行 + __sessionHooks 状态
-    const dbgLog = (s) => { try { fs.appendFileSync(path.join(dataDir, 'stall-debug.log'), `[${new Date().toISOString()}] ${s}\n`); } catch {} };
-    dbgLog(`DBG onload entered | sessionHooks=${typeof globalThis.__sessionHooks} | bus=${typeof bus}`);
+export default class HanaDownloaderPlugin {
+  constructor() {
+    this.ctx = null;
+    this.register = null; // host 在 new 之后注入 dispose 注册器
+  }
+
+  async onload() {
+    if (!this.ctx) {
+      console.warn("[hana-downloader] onload called without ctx");
+      return;
+    }
+    const ctx = this.ctx;
+    const helpers = { register: this.register };
+    const { bus, log: logF, dataDir } = ctx;
+    const logger = logF || ctx.log || { info() {}, warn() {}, error() {} };
+
+    // 诊断日志（写在插件数据目录下，确认 onload 执行 + v2 plugin ctx 字段）
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const dbgLog = (s) => {
+      try {
+        fs.appendFileSync(path.join(dataDir, "v2-load-debug.log"), `[${new Date().toISOString()}] ${s}\n`);
+      } catch {}
+    };
+    dbgLog(`DBG v2 onload entered | bus=${typeof bus} dataDir=${dataDir} pluginId=${ctx.pluginId}`);
+
     try {
+      // 1) 初始化 TaskManager 单例（globalThis 兜底，避免 plugin 加载器 lib 模块缓存造成多实例）
       const manager = getTaskManager(dataDir);
       manager.restore();
-      this.ctx._dl = manager;
-      globalThis.__dlManager = manager;
-      globalThis.__dlBus = bus;
+      ctx._dl = manager;
+      dbgLog(`DBG manager restored | tasks=${manager.tasks?.size ?? 0}`);
 
-      // 宿主 TaskRegistry：注册 type="download" 的 abort handler，让 stop_task 能取消下载。
-      // fire-and-forget：宿主 lifecycle onload 不等 async，先让 onload sync 返回，
-      // registerHandler 在后台异步执行（v1 bus allowlist 可能拒绝 task:* → try/catch 静默降级）。
-      registerHandler(bus, () => getTaskManager(dataDir)).catch(() => {});
-
-      // 投递层唯一权威（订阅 onFinal/onStall，维护 pending 队列）。
-      // 同步创建（不被 1ms 截断）：createDelivery 是 sync 返回，确保 globalThis.__dlDelivery
-      // 在 onload 返回前已设置，dl-sync.js 的 before_provider_request 回调才能调 injectForSession。
-      // onload 幂等：dev 槽重载/重复加载时先退订旧 delivery 的 onStall 订阅，
-      // 否则旧回调残留在 manager._stallCbs 单例数组上 → stall 事件双投。
-      if (globalThis.__dlDelivery && typeof globalThis.__dlDelivery.dispose === "function") {
-        try { globalThis.__dlDelivery.dispose(); } catch {}
-      }
-      globalThis.__dlDelivery = createDelivery({ bus, manager, dataDir, log });
-
-      // 注册 session-hooks adjudication：agent/pre-step 真同步注入。
-      // 实测（2026-09-02）：provider/before-request 在当前 host 从不触发（Pi 引擎不 emit before_provider_request），
-      // 但 agent/pre-step、tools/pre-execute 等 event 都由 decide 正常触发。agent/pre-step 的 invocation 带 messages，
-      // 正好是注入下载结果的理想位置（host 内置 lkr/dkr/skr 也用它处理 messages）。用 order=999 在 host 内置 hooks 之后注入。
+      // 2) 注册 task:register-handler（task.write 权限），让 stop_task 可取消下载。
+      //    v2 plugin bus request 自动注入 caller={kind:"plugin",pluginId}，
+      //    task.* 协议不需要 verified v2 app caller（仅 task.write 权限校验）。
       try {
-        const hooks = globalThis.__sessionHooks;
-        dbgLog(`DBG sessionHooks type=${typeof hooks} onDecision=${typeof hooks?.onDecision}`);
-        if (hooks && typeof hooks.onDecision === "function") {
-          if (globalThis.__dlHooksDispose) {
-            try { globalThis.__dlHooksDispose(); } catch {}
-          }
-          globalThis.__dlHooksDispose = hooks.onDecision(
-            "agent/pre-step",
-            async ({ session, messages }) => {
-              dbgLog(`DBG agent/pre-step adjudicator called | sessionFile=${session?.sessionFile} msgs=${Array.isArray(messages) ? messages.length : 'N/A'} delivery=${typeof globalThis.__dlDelivery}`);
-              if (!Array.isArray(messages)) return;
-              const delivery = globalThis.__dlDelivery;
-              if (!delivery || typeof delivery.injectForSession !== "function") return;
-              const sp = session?.sessionFile;
-              const before = messages.length;
-              const ret = delivery.injectForSession(sp, { messages });
-              if (ret.messages.length === before) return;
-              dbgLog(`DBG agent/pre-step injected (session=${sp}) msgs ${before}->${ret.messages.length}`);
-              return { messages: ret.messages };
-            },
-            { owner: "hana-downloader", order: 999 }
-          );
-          dbgLog("DBG registered agent/pre-step injection adjudicator (owner=hana-downloader, order=999)");
-        } else {
-          dbgLog(`DBG sessionHooks unavailable, fallback async`);
+        await registerHandler(bus, () => manager);
+        dbgLog(`DBG task:register-handler registered`);
+      } catch (e) {
+        dbgLog(`DBG task:register-handler WARN: ${e?.message || e}`);
+        logger.warn?.(`task:register-handler failed: ${e?.message || e}`);
+      }
+
+      // 3) 投递层（v0.13.0 deferred 直投）
+      //    退旧 delivery 避免 dev 槽重载残留（onStall 多订阅 → 双投 bug）。
+      if (ctx._dlDelivery && typeof ctx._dlDelivery.dispose === "function") {
+        try { ctx._dlDelivery.dispose(); } catch {}
+      }
+      ctx._dlDelivery = createDelivery({
+        ctx,
+        bus,
+        manager,
+        dataDir,
+        log: logger,
+      });
+      dbgLog(`DBG delivery created (v0.14.0: sync inject + deferred fallback)`);
+
+      // 3-b) 注册 agent/pre-step 真同步注入 adjudicator。
+      //      宿主在「下一条 LLM API 请求组装前」dispatch agent/pre-step；我们在这一步把 pending
+      //      队列里的 hana-background-result 拼进 messages，agent 无需收束当前会话即可感知。
+      dbgLog(`DBG hooks probe | ctx.hooks=${typeof ctx?.hooks} onDecision=${typeof ctx?.hooks?.onDecision} | globalThis.__sessionHooks=${typeof globalThis.__sessionHooks}`);
+      let hooksApi = null;
+      let hooksSource = "none";
+      try {
+        if (ctx.hooks && typeof ctx.hooks.onDecision === "function") {
+          hooksApi = ctx.hooks;
+          hooksSource = "ctx.hooks";
+        } else if (globalThis.__sessionHooks && typeof globalThis.__sessionHooks.onDecision === "function") {
+          hooksApi = globalThis.__sessionHooks;
+          hooksSource = "globalThis.__sessionHooks";
         }
       } catch (e) {
-        log.warn?.("[dl-sync] onDecision register ERR: " + (e?.message || e));
+        dbgLog(`DBG hooks probe ERR: ${e?.message || e}`);
+      }
+      if (hooksApi) {
+        try {
+          if (ctx._dlHooksDispose) { try { ctx._dlHooksDispose(); } catch {} }
+          ctx._dlHooksDispose = hooksApi.onDecision(
+            "agent/pre-step",
+            async ({ session, messages }) => {
+              const sp = session?.sessionPath || session?.sessionFile || null;
+              dbgLog(`DBG agent/pre-step called | session=${sp || "?"} msgs=${Array.isArray(messages) ? messages.length : "N/A"}`);
+              if (!Array.isArray(messages)) return;
+              const d = ctx._dlDelivery;
+              if (!d || typeof d.injectForSession !== "function") return;
+              const before = messages.length;
+              const ret = d.injectForSession(sp, { messages });
+              if (!ret || !Array.isArray(ret.messages) || ret.messages.length === before) return;
+              dbgLog(`DBG agent/pre-step INJECTED | session=${sp || "?"} msgs ${before}->${ret.messages.length}`);
+              return { messages: ret.messages };
+            },
+            { owner: ctx.pluginId || "hana-downloader", order: 999 }
+          );
+          dbgLog(`DBG registered agent/pre-step adjudicator via ${hooksSource} (order=999)`);
+        } catch (e) {
+          dbgLog(`DBG onDecision register ERR: ${e?.message || e}`);
+          logger.warn?.(`agent/pre-step register failed: ${e?.message || e}`);
+        }
+      } else {
+        dbgLog(`DBG NO hooks channel → sync injection unavailable, async-only`);
       }
 
-      log.info(`hana-downloader v0.11.0 loaded (delivery: onDecision + deferred)`);
+      // 4) onload 恢复兜底：补调已终态 + 未投递任务的 handleFinal。
+      //    host 重启导致 deferred 占位丢失场景。
+      try {
+        const TERMINAL = new Set(["done", "failed", "canceled", "interrupted"]);
+        let recoverCount = 0;
+        for (const t of manager.tasks.values()) {
+          if (!t || !t.taskId || !TERMINAL.has(t.state)) continue;
+          if (t.delivered === true) continue;
+          t.deferredRegistered = false;
+          recoverCount++;
+          dbgLog(`ONLOAD-RECOVER ${t.taskId} state=${t.state} received=${t.received}/${t.total} → re-deliver`);
+          try {
+            ctx._dlDelivery.handleFinal(t);
+          } catch (e) {
+            dbgLog(`ONLOAD-RECOVER ERR ${t.taskId}: ${e?.message || e}`);
+          }
+        }
+        if (recoverCount > 0) dbgLog(`ONLOAD-RECOVER total=${recoverCount}`);
+      } catch (e) {
+        dbgLog(`ONLOAD-RECOVER loop ERR: ${e?.message || e}`);
+      }
+
+      logger.info?.(`hana-downloader v0.14.0 v2 loaded (delivery: sync inject + deferred)`);
+      dbgLog(`DBG hana-downloader v0.14.0 v2 loaded`);
     } catch (e) {
-      log.warn?.("hana-downloader restore failed: " + (e?.message || e));
+      logger.warn?.(`hana-downloader restore failed: ${e?.message || e}`);
+      dbgLog(`DBG ERR: ${e?.message || e}`);
+    }
+  }
+
+  async onunload() {
+    // 释放 agent/pre-step adjudicator（避免重载后旧回调残留 → 双注入）
+    if (this.ctx && typeof this.ctx._dlHooksDispose === "function") {
+      try { this.ctx._dlHooksDispose(); } catch {}
+      this.ctx._dlHooksDispose = null;
+    }
+    // 释放本实例对 manager 的订阅（避免 dev 槽重载残留 → 双投）
+    if (this.ctx && this.ctx._dlDelivery && typeof this.ctx._dlDelivery.dispose === "function") {
+      try { this.ctx._dlDelivery.dispose(); } catch {}
     }
   }
 }
-

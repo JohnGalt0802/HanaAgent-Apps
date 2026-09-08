@@ -10,7 +10,7 @@ import { registerDeferred } from "../lib/deferred.js";
 
 export const name = "download-command";
 export const description =
-  "执行下载型命令（git clone / pnpm install）并显示实时进度卡片。需要克隆仓库或装依赖时优先用本工具。";
+  "执行下载型命令（git clone 克隆仓库 / pnpm install 安装依赖）并显示实时进度卡片。用于克隆 Git 仓库或安装 npm 依赖。";
 
 export const sessionPermission = { kind: "external_side_effect" };
 

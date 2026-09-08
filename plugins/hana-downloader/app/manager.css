@@ -51,8 +51,16 @@ html, body {
   line-height: 1.45;
   min-height: 60px;
   box-sizing: border-box;
-  /* 背景：自包含色板（宿主不重注 iframe 变量，勿信 var(--bg-card) 旧值） */
-  background: var(--mgr-bg, #FCFAF5);
+  /* 高度链：内容自适应，但不超过 iframe 视口；工具栏占位，列表在剩余空间内滚动。
+     不用 height:100%（宿主高度若跟随报高会循环），也不用固定 max-height（宿主上限一变就裁死）。 */
+  display: flex;
+  flex-direction: column;
+  /* 视口约束：内容自适应但不超过 iframe 可视高，列表在剩余空间内滚动。
+     不用固定 max-height（宿主视口一变就裁死），也不用 height:100%（宿主高度若跟随报高会循环）。 */
+  max-height: 100vh;
+  /* 背景：宿主卡片底色（--bg-card，工作台/面板卡片那一层），退而求其次用主背景 --bg，
+     再退到自包含色板。宿主已实测会向 iframe 注入变量。 */
+  background: var(--bg-card, var(--bg, var(--mgr-bg, #FCFAF5)));
 }
 
 /* 滚动条 */
@@ -64,11 +72,12 @@ html, body {
   background: transparent;
 }
 #dl-root ::-webkit-scrollbar-thumb {
-  background: var(--mgr-scrollbar, rgba(120, 120, 120, 0.35));
+  /* 宿主注入变量优先（自动跟随主题），自包含色板兜底 */
+  background: var(--text-muted, var(--mgr-scrollbar, rgba(120, 120, 120, 0.35)));
   border-radius: 4px;
 }
 #dl-root ::-webkit-scrollbar-thumb:hover {
-  background: var(--mgr-scrollbar-hover, rgba(120, 120, 120, 0.55));
+  background: var(--text, var(--mgr-scrollbar-hover, rgba(120, 120, 120, 0.55)));
 }
 
 /* 工具栏：设置 + 搜索 + 计数，紧凑一行 */
@@ -78,6 +87,7 @@ html, body {
   gap: 8px;
   row-gap: 4px; /* 窄面板下计数器整体换行，不再被挤出可视区 */
   flex-wrap: wrap;
+  flex: 0 0 auto; /* 不参与收缩，高度由内容决定 */
   padding: 6px 12px;
   border-bottom: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.1));
   position: relative;
@@ -226,8 +236,10 @@ html, body {
 
 .mgr-list {
   padding: 4px 8px 8px;
-  max-height: 1100px; /* 宿主上限已抬到 1200（fO），列表可视区~1109，任务基本全展开 */
+  flex: 1 1 auto;
+  min-height: 0; /* flex 子项可收缩：否则内容撞破容器，overflow-y 永远不触发 */
   overflow-y: auto;
+  overscroll-behavior: contain; /* 滚到边界不带动外层 */
 }
 .mgr-empty {
   padding: 20px 12px;

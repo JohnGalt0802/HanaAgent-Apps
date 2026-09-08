@@ -6,8 +6,7 @@ import { getTaskManager } from "../lib/dlcore.js";
 
 export const name = "download-cancel";
 export const description =
-  "取消进行中的下载任务（与 download-file 配对）。取消后状态变为 canceled；字节流任务的 .part 半成品会保留在磁盘供断点续传（实测行为，非删除），命令型任务（git clone 等）的半成品目录会被清理。" +
-  "典型场景：收到停滞通知后取消、速度不达标、源站不可用。";
+  "取消一个进行中的下载任务（传 taskId）。取消后状态为 canceled；字节流任务保留 .part 断点续传文件，命令型任务清理半成品目录。用于中止不需要/出错的下载（如速度不达标、源不可用）。";
 
 // v0.5.9：0.712.5 宿主要求插件工具必须声明 sessionPermission，否则 resolver 判 invalid target。
 // cancel 主动终止连接并删半成品，有外部副作用 → 与 download-file/command 一致用 external_side_effect。

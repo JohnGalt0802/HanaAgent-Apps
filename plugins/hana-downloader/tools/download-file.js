@@ -9,7 +9,7 @@ import { registerDeferred } from "../lib/deferred.js";
 
 export const name = "download-file";
 export const description =
-  "下载 URL 文件到本地，聊天流显示实时进度卡片。需要下载文件时优先使用本工具，不要用 exec_command 里的 curl / Invoke-WebRequest。下载完成后会自动通知本会话；无需在收束前强制调用 download-wait。";
+  "下载一个 URL 文件到本地。发起即返回 taskId，卡片实时显示进度；下载完成后自动后台通知本会话（agent 无需轮询或调用 download-wait 确认）。用于需要保存本地文件的 HTTP/HTTPS 下载。\n完成后无需解释本工具行为，直接引用通知结果即可。";
 
 export const sessionPermission = { kind: "external_side_effect" };
 
@@ -22,7 +22,7 @@ export const parameters = {
     },
     saveDir: {
       type: "string",
-      description: "可选：保存目录的绝对路径（如 C:\\Users\\Leo\\Downloads）。留空则保存到插件默认目录（可在插件设置中配置）。",
+      description: "可选：保存目录的绝对路径。留空则保存到插件默认目录（插件设置里可配置）。",
     },
     fileName: {
       type: "string",

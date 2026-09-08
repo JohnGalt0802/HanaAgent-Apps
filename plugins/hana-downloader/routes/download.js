@@ -40,6 +40,10 @@ export default function registerDownloadRoutes(app, ctx) {
   const base = "/api/plugins/" + ctx.pluginId;
   // 任务管理器实例（globalThis 单例，dataDir 为实际任务存储位置：community 槽）
   const taskMgr = getTaskManager(ctx.dataDir);
+  // 关键：host 可能在 plugin onload 之前调 routes（_loadRoutes 与 _activatePluginEntry 顺序），此时 tasks.json 未加载、
+  // fallback 取不到任务 → 卡片显示“缺少任务 ID”。这里幂等调 restore() 保证内存 Map 加载。
+  // restore() 内 `if (this.tasks.get(m.taskId)) continue` 避免覆盖内存里已有的任务，与 onload 后调不冲突。
+  try { taskMgr.restore(); } catch (e) { console.warn("[download] restore failed:", e?.message || e); }
 
   // ── 插件设置（默认下载目录等）与 tasks.json 同级存放（实际生效的 dataDir）──
   const CONFIG_FILE = path.join(taskMgr.dataDir, "config.json");
@@ -50,6 +54,19 @@ export default function registerDownloadRoutes(app, ctx) {
     fs.mkdirSync(ctx.dataDir, { recursive: true });
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(s, null, 2), "utf-8");
   }
+
+  // 诊断：卡片页面把实际生效的 CSS 变量与尺寸上报（排查用，无副作用）
+  app.post("/diag", async (c) => {
+    try {
+      const body = await c.req.json();
+      fs.appendFileSync(
+        path.join(taskMgr.dataDir, "manager-diag.log"),
+        JSON.stringify({ t: new Date().toISOString(), ...body }) + "\n",
+        "utf-8"
+      );
+    } catch (e) { /* 忽略 */ }
+    return c.json({ ok: true });
+  });
 
   // 读设置
   app.get("/settings", (c) => {
@@ -260,6 +277,10 @@ ${hcLink}
     if (!taskId) {
       try {
         const manager = getTaskManager(ctx.dataDir);
+        // 兑底：万一 routes 被调用时 Map 是空（比如 plugin 重载途中），再 restore 一次
+        if (manager.tasks.size === 0) {
+          try { manager.restore(); } catch { /* 失败交给下面过滤处理 */ }
+        }
         const all = manager.tasks ? [...manager.tasks.values()] : [];
         const active = all.filter((t) => t && (t.state === "running" || t.state === "pending"));
         const pick = active.length > 0 ? active[0] : all[all.length - 1];

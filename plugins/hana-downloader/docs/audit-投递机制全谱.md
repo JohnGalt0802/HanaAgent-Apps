@@ -1,6 +1,8 @@
 # hana-downloader 插件 · 投递/通知机制全谱 & 版本演进审计报告
 
 > 落盘时间：2026-09-01
+> ⚠️ **历史审计（v0.5.x → v0.9.x）**。文中的 `pi.sendMessage` / `deferred:steer` / `session:send-custom` 通道在 0.928.0 已全部失效或不存在。
+> 当前投递通道见 `docs/host-changelog/v0.14.0-sync-restore.md`；本文保留作为通道演进档案。
 > 范围：`<workspace>\hana-downloader` 全树（README / PROJECT_REQUIREMENTS / 踩坑记录 / lib / extensions / docs / patch）
 > 目的：把插件所有"通知/投递"通道分门别类、看清面向谁、分清两条线（agent 消息 vs 前端视图）、摸清 v0.5.x → v0.9.x 演进脉络，并解释为何用户会在前端持续看到"同步投递"提示而 agent 侧感知不一致。
 
