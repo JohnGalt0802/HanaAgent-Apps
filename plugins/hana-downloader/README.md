@@ -4,9 +4,9 @@
 > 下载任务实时可视化、进度状态可查询、中途可干预、终态可靠通知。
 > 同时提供命令型下载（git clone / pnpm install）与跨会话下载管理器。
 
-- 当前版本：v0.14.0
+- 当前版本：v0.15.0
 - 权限要求：full-access
-- 运行环境：HanaAgent 0.928.0（实测基线；同步投递需 host bundle 魔改，已脚本化自动重建）
+- 运行环境：HanaAgent 0.928.0 / 0.938.12（实测基线；同步投递优先走 v2 app 正门，bundle 魔改作兜底）
 
 ---
 
@@ -37,13 +37,13 @@
 - 数据层 → 工具层：`onceFinal(taskId)` 提供终态一次性等待原语；`onFinal/onStall` 回调驱动投递分流。
 - 工具层 → 宿主：`deferred:register/resolve` 总线通道承载跨回合投递。
 
-## 二、核心机制：v0.14.0 双通道通知
+## 二、核心机制：v0.15.0 三通道通知
 
 下载完成通知按 agent 当前状态分两条：
 
 | agent 状态 | 投递路径 | agent 感知时机 |
 |---|---|---|
-| 未收束 | **真同步**：注册 `agent/pre-step` adjudicator（order 999），把 HBR 拼进**下一条 LLM API 请求的 messages**（需 bundle 魔改暴露 hooks registry） | **当前轮** 下一次思考即看到 HBR |
+| 未收束 | **真同步**：`agent/pre-step` adjudicator 把 HBR 拼进**下一条 LLM API 请求的 messages**。通道优先级：v2 app 正门（配套 `hd-sync-bridge`）→ bundle 魔改 | **当前轮** 下一次思考即看到 HBR |
 | 未收束但 agent 做长任务（>30s 无 API）| **续等**：pending 30s 未被消费时用 `isSessionActive` 判 session 实时态，活跃则 RESCHEDULE，agent 发 API 时注入（上限 10min） | agent 后续 API 调用注入 |
 | 已收束 | **异步唤醒**：`deferred:register + resolve` → host dispatcher（busy→followUp，idle→triggerTurn） | 新 turn input 看到 HBR |
 
@@ -51,9 +51,26 @@
 
 完整机制见 `docs/host-changelog/v0.14.0-sync-restore.md`（四场景实测 + 证据）；历史链路见 `docs/v0.11.0-真同步投递完整机制.md`。
 
-### 真同步部署前置（必要）
+### 同步投递通道（v0.15.0：正门优先，魔改兜底）
 
-宿主 bundle 需魔改一行暴露 hooks registry（锚点随宿主版本变，用脚本自动定位）：
+v2 plugin 的 `ctx` 没有 `hooks` 成员（实测 `ctx.hooks=undefined`），`agent/pre-step` 正门只对 **v2 app** 开放。v0.15.0 因此采用桥接，让两边各干擅长的：
+
+```text
+hana-downloader (v2 plugin，宿主进程内、无沙箱)
+   └─ 下载回执 → 原子写入 {HANA_HOME}/app-data/hd-sync-bridge/queue/<key>.json
+hd-sync-bridge (v2 app，独立子进程 + 权限沙箱，持有 app/hooks.agent-pre-step)
+   └─ agent/pre-step → 读队列 → 拼进 messages → 删除文件
+```
+
+一条回执只走一条通道：`ctx.hooks`（插件被当 app 跑时）> 桥接 > 魔改。桥接靠 `ready.json` 心跳判活（120s 内有效），心跳过期自动回退魔改；两条通道互斥，不会双投。
+
+**配套 app 安装（推荐，否则退回魔改）**：
+
+1. 把 `companion-app/hd-sync-bridge/` 复制到 `{HANA_HOME}/apps/hd-sync-bridge/`
+2. 设置 → Apps → 批准该 app
+3. 设置 → Security → App capabilities → 打开 `app/hooks.agent-pre-step`
+
+**bundle 魔改（兜底，可选）**：宿主 bundle 需暴露 hooks registry（锚点随宿主版本变，用脚本自动定位）：
 
 ```js
 // 紧跟 `const se = t.sessionHooks ?? oot();`（0.928.0）
@@ -61,7 +78,7 @@ globalThis.__sessionHooks = se;
 globalThis.__hanaEngine = O;
 ```
 
-宿主升级会覆盖 bundle，魔改随之丢失。现在由 `<workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1` 自动重建（已挂进 `restart-hana-reliable.ps1`，重启前自动执行）。魔改缺失时插件静默降级为「收束后 deferred 唤醒」，不丢回执但失去同步语义。
+宿主升级会覆盖 bundle，魔改随之丢失。由 `<workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1` 自动重建（已挂进 `restart-hana-reliable.ps1`，重启前自动执行）。桥接与魔改都不可用时，插件静默降级为「收束后 deferred 唤醒」，不丢回执但失去同步语义。
 
 ### HBR 根标签 7 属性
 
@@ -142,7 +159,10 @@ tools/download-cancel.js     取消工具
 routes/download.js           卡片页/管理器页/status/list/cancel/prepare/reveal/settings 路由
 app/card.css|card.js         进度卡片前端（自包含色板、折叠交互、报高）
 app/manager.css|manager.js   跨会话管理器前端
-docs/host-changelog/v0.14.0-sync-restore.md  当前机制与实测（权威）
+docs/host-changelog/0.938.12-bridge-sync-verified.md  桥接方案落地与实测（权威）
+docs/host-changelog/0.938.12-hooks-gate-v2app.md      v2 app hooks 正门实测
+companion-app/hd-sync-bridge/                          配套 v2 app（同步投递正门）
+docs/host-changelog/v0.14.0-sync-restore.md  魔改通道机制与实测
 docs/card-width-and-container.md   聊天流卡片宽度与容器约束（实测）
 docs/host-bundle-mods.md      宿主魔改重建手册（内部，含本机路径，不入公开库）
 docs/v0.11.0-真同步投递完整机制.md   历史机制文档（v1 契约时代）
@@ -150,7 +170,7 @@ docs/v0.11.0-真同步投递完整机制.md   历史机制文档（v1 契约时�
 
 ---
 
-## 六、宿主魔改部署步骤（v0.14.0 起脚本化）
+## 六、部署步骤（v0.15.0：配套 app 优先，魔改可选）
 
 ```powershell
 # 脚本放在你的工作区 _tools 下；路径按实际位置替换

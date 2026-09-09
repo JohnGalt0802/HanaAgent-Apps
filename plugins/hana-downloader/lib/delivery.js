@@ -17,6 +17,7 @@
 // 魔改通道）；本模块只负责 pending 队列的入队与消费。
 
 import fs from "node:fs";
+import path from "node:path";
 
 const TERMINAL = new Set(["done", "failed", "canceled", "interrupted"]);
 const SYNC_WAIT_MS = 30000; // 等下一条 provider request 的时间，超时降级异步
@@ -64,13 +65,72 @@ function tailSettled(sessionPath) {
  * @param {string} opts.dataDir 插件数据目录
  * @param {object} opts.log  日志对象
  */
-export function createDelivery({ ctx, bus, manager, dataDir, log }) {
+export function createDelivery({ ctx, bus, manager, dataDir, log, bridgeQueueDir = null }) {
   const logger = log || ctx?.log || { info() {}, warn() {}, error() {} };
   function logInfo(s) { try { logger.info?.(s); } catch {} }
   function logWarn(s) { try { logger.warn?.(s); } catch {} }
 
   const PLUGIN_ID = ctx?.pluginId || "hana-downloader";
   const pending = new Map(); // key -> { task, result, entry, timer, sessionPath, waitTotal, kind }
+
+  // ── 桥接通道（v2 app hd-sync-bridge 的 agent/pre-step 正门）──
+  // v2 plugin 的 ctx 没有 hooks（实测 ctx.hooks=undefined），拿不到同步注入正门；
+  // 于是把回执原子写入桥接 app 的 dataDir 队列，由那个 app 在 agent/pre-step 里读走并注入。
+  // 文件被读走（消失）即视为已投递；超时前文件仍在则降级 deferred。
+  const BRIDGE_DIR = bridgeQueueDir || null;
+  function bridgeFile(key) {
+    return BRIDGE_DIR ? path.join(BRIDGE_DIR, `${key}.json`) : null;
+  }
+  function bridgeWrite(key, item) {
+    if (!BRIDGE_DIR) return false;
+    try {
+      fs.mkdirSync(BRIDGE_DIR, { recursive: true });
+      const tmp = path.join(BRIDGE_DIR, `${key}.tmp`);
+      const dst = path.join(BRIDGE_DIR, `${key}.json`);
+      fs.writeFileSync(tmp, JSON.stringify({
+        key,
+        sessionPath: item.sessionPath || null,
+        content: item.entry?.content ?? null,
+        details: item.entry?.details ?? null,
+        createdAt: Date.now(),
+      }), "utf8");
+      fs.renameSync(tmp, dst);
+      return true;
+    } catch (e) {
+      logWarn(`[delivery] BRIDGE-WRITE ERR ${key}: ${e?.message || e}`);
+      return false;
+    }
+  }
+  function bridgeDrop(key) {
+    const f = bridgeFile(key);
+    if (!f) return;
+    try { fs.unlinkSync(f); } catch {}
+  }
+  function bridgeConsumed(key) {
+    const f = bridgeFile(key);
+    if (!f) return false;
+    try { return !fs.existsSync(f); } catch { return false; }
+  }
+  // 桥接 app 的心跳：app 在 apply 时写 ready.json 并在每次 pre-step 刷新；
+  // 插件入队时读它判断桥接是否真的在线，不在线就回退其他通道。
+  const BRIDGE_READY = BRIDGE_DIR ? path.join(path.dirname(BRIDGE_DIR), "ready.json") : null;
+  function bridgeReady() {
+    if (!BRIDGE_READY) return false;
+    try {
+      const o = JSON.parse(fs.readFileSync(BRIDGE_READY, "utf8"));
+      return typeof o?.at === "number" && Date.now() - o.at < 120000;
+    } catch { return false; }
+  }
+  // ── 注入通道选择：ctx.hooks（app 形态）> 桥接（v2 app 正门）> 魔改 ──
+  // 一条回执只走一条通道，避免双投。
+  function pickChannel() {
+    try {
+      if (ctx?.hooks && typeof ctx.hooks.onDecision === "function") return "hooks";
+      if (bridgeReady()) return "bridge";
+      if (globalThis.__sessionHooks && typeof globalThis.__sessionHooks.onDecision === "function") return "hooks";
+    } catch {}
+    return "none";
+  }
 
   // ── 终态结果构造 ──
   function buildResult(task) {
@@ -228,12 +288,28 @@ export function createDelivery({ ctx, bus, manager, dataDir, log }) {
     } else if (t) {
       t._delivered = true;
     }
+    const channel = pickChannel();
+    item.channel = channel;
     pending.set(key, item);
-    logInfo(`[delivery] SYNC-ENQUEUE ${key} (${kind}) session=${item.sessionPath || "?"} → wait agent/pre-step`);
+    const bridgeOk = channel === "bridge" && item.sessionPath ? bridgeWrite(key, item) : false;
+    logInfo(`[delivery] SYNC-ENQUEUE ${key} (${kind}) channel=${channel} session=${item.sessionPath || "?"} → wait agent/pre-step`);
 
     const schedule = (ms) => {
       item.timer = setTimeout(() => {
         if (pending.get(key) !== item) return;
+        // 桥接模式：队列文件被 app 读走 = 已注入，直接收工（不重复投递）
+        if (bridgeOk && bridgeConsumed(key)) {
+          pending.delete(key);
+          const realTask = item.task;
+          if (item.kind === "stall") {
+            if (realTask) realTask._stallDelivered = true;
+          } else if (realTask) {
+            markDelivered(realTask);
+            finalizeRegistry(realTask);
+          }
+          logInfo(`[delivery] BRIDGE-CONSUMED ${key} (${kind}) → injected by hd-sync-bridge`);
+          return;
+        }
         const active = sessionActive(item.sessionPath);
         if (active === true && item.waitTotal < SYNC_MAX_WAIT_MS) {
           item.waitTotal += ms;
@@ -242,6 +318,7 @@ export function createDelivery({ ctx, bus, manager, dataDir, log }) {
           return;
         }
         pending.delete(key);
+        bridgeDrop(key);
         logInfo(`[delivery] SYNC-TIMEOUT ${key} (${kind}) → fallback async`);
         if (kind === "stall") {
           deliverStallAsync(item.task, item.result, key).catch(() => {});
@@ -259,6 +336,7 @@ export function createDelivery({ ctx, bus, manager, dataDir, log }) {
     if (!payload || !Array.isArray(payload.messages) || pending.size === 0) return payload;
     const injected = [];
     for (const [key, item] of Array.from(pending)) {
+      if (item.channel && item.channel !== "hooks") continue;
       const itemSession = item.sessionPath || item.task?.sessionPath || item.task?.sessionRef?.path;
       if (sessionPath && itemSession && !sameSession(sessionPath, itemSession)) continue;
       if (item.timer) clearTimeout(item.timer);

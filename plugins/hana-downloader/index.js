@@ -1,4 +1,4 @@
-// index.js — hana-downloader v0.14.0 v2 plugin lifecycle（零依赖版）
+// index.js — hana-downloader v0.15.0 v2 plugin lifecycle（零依赖版 + 桥接同步投递）
 //
 // 投递架构（v0.14.0，宿主 0.928.0）：
 //   - lib/delivery.js 是唯一投递权威：订阅 mgr.onFinal/onStall。
@@ -68,14 +68,27 @@ export default class HanaDownloaderPlugin {
       if (ctx._dlDelivery && typeof ctx._dlDelivery.dispose === "function") {
         try { ctx._dlDelivery.dispose(); } catch {}
       }
+      // 3-a) 桥接队列目录：v2 app hd-sync-bridge 的 dataDir（{HANA_HOME}/app-data/hd-sync-bridge/queue）。
+      //      插件是 v2 plugin（跑在宿主进程内、无沙箱），可以直接写该目录；
+      //      桥接 app 持有官方 agent/pre-step 正门，负责在下一条模型请求前读走并注入。
+      let bridgeQueueDir = null;
+      try {
+        const hanaHome = path.dirname(path.dirname(dataDir));
+        bridgeQueueDir = path.join(hanaHome, "app-data", "hd-sync-bridge", "queue");
+        dbgLog(`DBG bridge queue dir = ${bridgeQueueDir}`);
+      } catch (e) {
+        dbgLog(`DBG bridge queue dir ERR: ${e?.message || e}`);
+      }
+
       ctx._dlDelivery = createDelivery({
         ctx,
         bus,
         manager,
         dataDir,
         log: logger,
+        bridgeQueueDir,
       });
-      dbgLog(`DBG delivery created (v0.14.0: sync inject + deferred fallback)`);
+      dbgLog(`DBG delivery created (v0.15.0: bridge + sync inject + deferred fallback)`);
 
       // 3-b) 注册 agent/pre-step 真同步注入 adjudicator。
       //      宿主在「下一条 LLM API 请求组装前」dispatch agent/pre-step；我们在这一步把 pending
@@ -119,7 +132,7 @@ export default class HanaDownloaderPlugin {
           logger.warn?.(`agent/pre-step register failed: ${e?.message || e}`);
         }
       } else {
-        dbgLog(`DBG NO hooks channel → sync injection unavailable, async-only`);
+        dbgLog(`DBG NO hooks channel → bridge mode (queue=${bridgeQueueDir || "n/a"})`);
       }
 
       // 4) onload 恢复兜底：补调已终态 + 未投递任务的 handleFinal。
@@ -144,8 +157,8 @@ export default class HanaDownloaderPlugin {
         dbgLog(`ONLOAD-RECOVER loop ERR: ${e?.message || e}`);
       }
 
-      logger.info?.(`hana-downloader v0.14.0 v2 loaded (delivery: sync inject + deferred)`);
-      dbgLog(`DBG hana-downloader v0.14.0 v2 loaded`);
+      logger.info?.(`hana-downloader v0.15.0 v2 loaded (delivery: bridge/sync inject + deferred)`);
+      dbgLog(`DBG hana-downloader v0.15.0 v2 loaded`);
     } catch (e) {
       logger.warn?.(`hana-downloader restore failed: ${e?.message || e}`);
       dbgLog(`DBG ERR: ${e?.message || e}`);
