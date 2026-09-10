@@ -10,6 +10,7 @@
 - [0.930.1-sdk-diff-and-repatch.md](./0.930.1-sdk-diff-and-repatch.md) — 0.930.1 自动更新覆盖 bundle：SDK 逐项对比（无实质变化）+ 魔改重建实测
 - [0.938.12-hooks-gate-v2app.md](./0.938.12-hooks-gate-v2app.md) — 0.938.12 魔改再次被覆盖；实测确认 v2 app 的 `ctx.hooks.onDecision("agent/pre-step")` 正门可用（注册→咨询→跨进程注入全通），v2 plugin 仍无 hooks
 - [0.938.12-bridge-sync-verified.md](./0.938.12-bridge-sync-verified.md) — 桥接方案（插件写队列 + v2 app 正门注入）落地并端到端实测通过；一条回执只走一条通道，桥接掉线自动回退魔改
+- [0.946.2-bridge-verified.md](./0.946.2-bridge-verified.md) — 0.946.2 上桥接继续有效：`ctx.hooks` 对 plugin 仍为 undefined；新版会话钩子正式化为 App 域能力（10 决策点 + 6 事件，各一条 `app/hooks.*` 权限）；同步/异步投递双通道端到端复验；新增 task-registry WARN
 
 ## 维护规则
 
