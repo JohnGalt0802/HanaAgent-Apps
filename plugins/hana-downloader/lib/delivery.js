@@ -1,27 +1,27 @@
-// lib/delivery.js — hana-downloader 投递层唯一权威（v0.14.0 真同步注入恢复）
+// lib/delivery.js — hana-downloader 投递层唯一权威（v0.15.0 桥接同步 + deferred 兵底）
 //
-// 设计（v0.14.0，宿主 0.928.0）：
+// 设计：
 //   - 未收束会话（agent 正处于流式回复中，当前 turn 未结束）：
 //     终态 / stall 进入 pending 队列 → 宿主下一次 agent/pre-step 决策时（即下一条 LLM API
 //     请求组装前）把 hana-background-result 拼进该请求的 messages → agent 在不收束会话的
 //     前提下，下一次思考即感知下载完成。这就是「同步投递」。
 //   - 已收束会话：直接 deferred:register + deferred:resolve，宿主 dispatcher 毫秒级接管
 //     （agent busy → followUp 排队；agent idle → triggerTurn 唤醒新 turn）。
-//   - 超时兜底：pending 在 SYNC_WAIT_MS 内未被任何 agent/pre-step 消费 → 降级 deferred，
-//     保证不丢回执；若 bundle 魔改暴露了 isSessionActive 且会话仍活跃，则续等（上限 10 分钟）。
+//   - 超时兜底：pending 在 SYNC_WAIT_MS 内未被消费 → 降级 deferred，保证不丢回执。
 //   - agent 取消（canceledBy=agent）：静默（download-cancel 同步返回值就是结果）。
 //   - user 取消（canceledBy=user）：异步通知（带 hint）。
 //   - 每任务只允许一条回执：内存 _delivered + 持久化 delivered 双重去重。
 //
-// 注入通道由 index.js 在 onload 时注册（优先 v2 ctx.hooks 正门，退 globalThis.__sessionHooks
-// 魔改通道）；本模块只负责 pending 队列的入队与消费。
+// 注入通道：
+//   - v2 ctx.hooks（插件被当 app 跑时才有，本插件通常为 undefined）→ 插件自注册 adjudicator
+//   - 桥接：配套 v2 app hd-sync-bridge 持有官方 agent/pre-step 正门，读队列注入（当前主通道）
+//   两条通道互斥，一条回执只走一条，不会双投。
 
 import fs from "node:fs";
 import path from "node:path";
 
 const TERMINAL = new Set(["done", "failed", "canceled", "interrupted"]);
 const SYNC_WAIT_MS = 30000; // 等下一条 provider request 的时间，超时降级异步
-const SYNC_MAX_WAIT_MS = 10 * 60 * 1000; // 续等总上限：防悬挂工具永不出结果
 
 function statusOf(task) {
   return task ? (task.state || task.status || "") : "";
@@ -71,7 +71,7 @@ export function createDelivery({ ctx, bus, manager, dataDir, log, bridgeQueueDir
   function logWarn(s) { try { logger.warn?.(s); } catch {} }
 
   const PLUGIN_ID = ctx?.pluginId || "hana-downloader";
-  const pending = new Map(); // key -> { task, result, entry, timer, sessionPath, waitTotal, kind }
+  const pending = new Map(); // key -> { task, result, entry, timer, sessionPath, kind }
 
   // ── 桥接通道（v2 app hd-sync-bridge 的 agent/pre-step 正门）──
   // v2 plugin 的 ctx 没有 hooks（实测 ctx.hooks=undefined），拿不到同步注入正门；
@@ -121,13 +121,12 @@ export function createDelivery({ ctx, bus, manager, dataDir, log, bridgeQueueDir
       return typeof o?.at === "number" && Date.now() - o.at < 120000;
     } catch { return false; }
   }
-  // ── 注入通道选择：ctx.hooks（app 形态）> 桥接（v2 app 正门）> 魔改 ──
+  // ── 注入通道选择：ctx.hooks（app 形态）> 桥接（v2 app 正门）──
   // 一条回执只走一条通道，避免双投。
   function pickChannel() {
     try {
       if (ctx?.hooks && typeof ctx.hooks.onDecision === "function") return "hooks";
       if (bridgeReady()) return "bridge";
-      if (globalThis.__sessionHooks && typeof globalThis.__sessionHooks.onDecision === "function") return "hooks";
     } catch {}
     return "none";
   }
@@ -260,16 +259,7 @@ export function createDelivery({ ctx, bus, manager, dataDir, log, bridgeQueueDir
     }
   }
 
-  // ── 会话实时态（仅 bundle 魔改暴露时可用；返回 null = 不可判）──
-  function sessionActive(sessionPath) {
-    try {
-      const fn = globalThis.__sessionHooks?.isSessionActive;
-      if (typeof sessionPath !== "string" || typeof fn !== "function") return null;
-      return fn(sessionPath) === true;
-    } catch { return null; }
-  }
-
-  // ── 同步注入入队：等下一条 agent/pre-step 消费 ──
+  // ── 同步注入入队：等下一个 agent/pre-step 消费 ──
   function enqueueSync(t, entry, keyOverride = null, kind = "final") {
     const key = keyOverride || t.taskId;
     const item = {
@@ -278,7 +268,6 @@ export function createDelivery({ ctx, bus, manager, dataDir, log, bridgeQueueDir
       entry,
       sessionPath: t.sessionPath || t.sessionRef?.path || null,
       timer: null,
-      waitTotal: 0,
       kind,
     };
     // 入队即置位：同一 manager 单例若残留多个订阅（dev 槽重载未退订），
@@ -308,13 +297,6 @@ export function createDelivery({ ctx, bus, manager, dataDir, log, bridgeQueueDir
             finalizeRegistry(realTask);
           }
           logInfo(`[delivery] BRIDGE-CONSUMED ${key} (${kind}) → injected by hd-sync-bridge`);
-          return;
-        }
-        const active = sessionActive(item.sessionPath);
-        if (active === true && item.waitTotal < SYNC_MAX_WAIT_MS) {
-          item.waitTotal += ms;
-          logInfo(`[delivery] RESCHEDULE ${key} (${kind}): session active, keep waiting (${item.waitTotal}ms)`);
-          schedule(ms);
           return;
         }
         pending.delete(key);

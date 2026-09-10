@@ -6,7 +6,7 @@
 
 - 当前版本：v0.15.0
 - 权限要求：full-access
-- 运行环境：HanaAgent 0.928.0 / 0.938.12（实测基线；同步投递优先走 v2 app 正门，bundle 魔改作兜底）
+- 运行环境：HanaAgent 0.946.2（实测基线）；同步投递走配套 v2 app 正门（`companion-app/hd-sync-bridge`）
 
 ---
 
@@ -43,42 +43,35 @@
 
 | agent 状态 | 投递路径 | agent 感知时机 |
 |---|---|---|
-| 未收束 | **真同步**：`agent/pre-step` adjudicator 把 HBR 拼进**下一条 LLM API 请求的 messages**。通道优先级：v2 app 正门（配套 `hd-sync-bridge`）→ bundle 魔改 | **当前轮** 下一次思考即看到 HBR |
-| 未收束但 agent 做长任务（>30s 无 API）| **续等**：pending 30s 未被消费时用 `isSessionActive` 判 session 实时态，活跃则 RESCHEDULE，agent 发 API 时注入（上限 10min） | agent 后续 API 调用注入 |
+| 未收束 | **真同步**：配套 v2 app `hd-sync-bridge` 在 `agent/pre-step` 把 HBR 拼进**下一条 LLM API 请求的 messages** | **当前轮** 下一次思考即看到 HBR |
 | 已收束 | **异步唤醒**：`deferred:register + resolve` → host dispatcher（busy→followUp，idle→triggerTurn） | 新 turn input 看到 HBR |
 
-同步超时（30s 且无法判定活跃）→ 自动降级异步，不丢回执。
+同步超时（30s 内未被桥接消费）→ 自动降级异步，不丢回执。
 
 完整机制见 `docs/host-changelog/v0.14.0-sync-restore.md`（四场景实测 + 证据）；历史链路见 `docs/v0.11.0-真同步投递完整机制.md`。
 
-### 同步投递通道（v0.15.0：正门优先，魔改兜底）
+### 同步投递通道（v0.15.0：桥接单通道）
 
-v2 plugin 的 `ctx` 没有 `hooks` 成员（实测 `ctx.hooks=undefined`），`agent/pre-step` 正门只对 **v2 app** 开放。v0.15.0 因此采用桥接，让两边各干擅长的：
+plugin 形态的 `ctx` 没有 `hooks` 成员（实测 `ctx.hooks=undefined`），`agent/pre-step` 正门只对 **v2 app** 开放。v0.15.0 因此采用桥接，让两边各干擅长的：
 
 ```text
-hana-downloader (v2 plugin，宿主进程内、无沙箱)
+hana-downloader (plugin，宿主进程内、无沙箱)
    └─ 下载回执 → 原子写入 {HANA_HOME}/app-data/hd-sync-bridge/queue/<key>.json
 hd-sync-bridge (v2 app，独立子进程 + 权限沙箱，持有 app/hooks.agent-pre-step)
    └─ agent/pre-step → 读队列 → 拼进 messages → 删除文件
 ```
 
-一条回执只走一条通道：`ctx.hooks`（插件被当 app 跑时）> 桥接 > 魔改。桥接靠 `ready.json` 心跳判活（120s 内有效），心跳过期自动回退魔改；两条通道互斥，不会双投。
+一条回执只走一条通道：`ctx.hooks`（插件被当 app 跑时才有）> 桥接。桥接靠 `ready.json` 心跳判活（120s 内有效），心跳过期时回执不写队列，直接走异步唤醒；两条通道互斥，不会双投。
 
-**配套 app 安装（推荐，否则退回魔改）**：
+**配套 app 安装（必需，否则没有同步语义）**：
 
 1. 把 `companion-app/hd-sync-bridge/` 复制到 `{HANA_HOME}/apps/hd-sync-bridge/`
 2. 设置 → Apps → 批准该 app
 3. 设置 → Security → App capabilities → 打开 `app/hooks.agent-pre-step`
 
-**bundle 魔改（兜底，可选）**：宿主 bundle 需暴露 hooks registry（锚点随宿主版本变，用脚本自动定位）：
+桥接不可用时的行为：静默降级为「收束后 deferred 唤醒」，不丢回执但失去同步语义。
 
-```js
-// 紧跟 `const se = t.sessionHooks ?? oot();`（0.928.0）
-globalThis.__sessionHooks = se;
-globalThis.__hanaEngine = O;
-```
-
-宿主升级会覆盖 bundle，魔改随之丢失。由 `<workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1` 自动重建（已挂进 `restart-hana-reliable.ps1`，重启前自动执行）。桥接与魔改都不可用时，插件静默降级为「收束后 deferred 唤醒」，不丢回执但失去同步语义。
+> bundle 魔改通道已于 2026-09-10 下线（打补丁脚本已删、宿主 bundle 已还原）。
 
 ### HBR 根标签 7 属性
 
@@ -170,25 +163,40 @@ docs/v0.11.0-真同步投递完整机制.md   历史机制文档（v1 契约时�
 
 ---
 
-## 六、部署步骤（v0.15.0：配套 app 优先，魔改可选）
+## 六、安装
+
+### 方式一：宿主安装入口（推荐分发）
+
+1. 拿到分发包 `hana-downloader-<version>.zip`，先解压出 `hana-downloader/` 文件夹；
+2. HanaAgent → 扩展中心 → 「本地安装」，选择该**文件夹**（安装入口认目录，不直接吃 zip）；
+3. 确认审查卡，批准；
+4. 重启宿主（legacy 插件没有热重载）。
+
+> 包内 `manifest.json` **不写 `manifestVersion`**，走宿主的 legacy 插件通道（staged 结果 `runtime: "v1"`）。
+> 若写成 `manifestVersion: 2`，安装入口会按 v2 App 规范严格校验（`contributes.configuration`、卡片 `type` 等字段都会被拒），这条包就装不上。
+
+### 方式二：手动放置
+
+把 `hana-downloader/` 整个目录放进 `~/.hanako/plugins/`，重启宿主。
+
+### 配套 app（同步投递正门）
+
+`companion-app/hd-sync-bridge/` 是独立的 v2 app，需单独装到 `~/.hanako/apps/`，并在「设置 → Apps → App 能力」授权 `app/hooks.agent-pre-step`。缺了它，同步投递会退回 deferred 异步唤醒。
+
+---
+
+## 七、重启与调试
 
 ```powershell
-# 脚本放在你的工作区 _tools 下；路径按实际位置替换
-# 自动：定位当前 bundle → 检测 marker → 打补丁 → 自动备份 → 校验
-pwsh -NoProfile -File <workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1
-
-# 预演（不写盘）
-pwsh -NoProfile -File <workspace>\_tools\hana-host-patches\ensure-session-hooks-patch.ps1 -DryRun
-
-# 重启宿主（脚本内已含魔改检查，一般不必单独跑）
+# 重启宿主（重启后插件重新加载；bundle 魔改已于 2026-09-10 下线）
 pwsh -File <workspace>\_tools\restart-hana\restart-hana-reliable.ps1
 ```
 
-脚本会幂等处理：已打则报 `OK: 魔改已在位`；锚点结构变了会报 `ERR: 未找到 sessionHooks 锚点`，需人工介入（见 `docs/host-bundle-mods.md` §5）。
+同步投递只走桥接 app 一条通道（`companion-app/hd-sync-bridge`）；它不在线时自动回退 deferred 异步唤醒。bundle 魔改通道已废弃并移除，旧手册 `docs/host-bundle-mods.md` 仅作历史参考。
 
 **调试日志**（运行时写，不影响功能）：
-- 插件数据目录 `v2-load-debug.log`：onload / hooks probe / adjudicator called / **INJECTED**（v0.14.0 起同步投递的判据）
-- 插件数据目录 `stall-debug.log`：历史日志（v0.13 及之前）
+- 插件数据目录 `v2-load-debug.log`：onload / hooks probe / **INJECTED**（同步投递判据）
+- 宿主日志搜索 `[hd-sync-bridge]`：`adjudicator registered` / `INJECT n item(s)`
 
 ---
 

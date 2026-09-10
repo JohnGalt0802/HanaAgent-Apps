@@ -65,7 +65,7 @@ export async function execute(input, toolCtx) {
   // 已终态 → 标记已消费 + 立即返回事实
   if (FINAL[snap.state]) {
     manager.markConsumedByWait(taskId);
-    // v0.9.3：不再调 deferred:suppress（宿主无此路由，魔改时代死通道）。占位若存在则任其过期：
+    // 历史注记（v0.9.3）：不再调 deferred:suppress（宿主无此路由）。占位若存在则任其过期：
     // 不 resolve 即不发 deferred_result 事件，会话销毁时宿主经 store.suppressDelivery 内部静默清理
     // （0.814 bundle 源码实证）。registry 层终结由扩展 dl-nextturn 的 consumed 分支统一处理。
     return buildResult(snap, { notifyRegistered: false, done: true });

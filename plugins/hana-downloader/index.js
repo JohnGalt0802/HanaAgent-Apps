@@ -1,15 +1,15 @@
 // index.js — hana-downloader v0.15.0 v2 plugin lifecycle（零依赖版 + 桥接同步投递）
 //
-// 投递架构（v0.14.0，宿主 0.928.0）：
+// 投递架构（v0.15.0，宿主 0.946.2）：
 //   - lib/delivery.js 是唯一投递权威：订阅 mgr.onFinal/onStall。
-//   - 真同步注入：onload 注册 agent/pre-step adjudicator，宿主在下一条 LLM API 请求组装前
-//     dispatch，我们把 pending 里的 hana-background-result 拼进 messages → 未收束会话
-//     的 agent 下一次思考即感知（不打断当前流式回复）。
-//     通道优先级：v2 ctx.hooks（宿主原生正门，抗宿主更新）→ globalThis.__sessionHooks（bundle 魔改通道）。
+//   - 真同步注入：配套 v2 app hd-sync-bridge 持有官方 agent/pre-step 正门，宿主在下一条
+//     LLM API 请求组装前 dispatch，桥接把回执拼进 messages → 未收束会话的 agent 下一次
+//     思考即感知（不打断当前流式回复）。
+//     另有 v2 ctx.hooks 分支（插件被当 app 跑时才存在，本插件通常为 undefined）。
 //   - 已收束会话：deferred:register + deferred:resolve，宿主 dispatcher 接管（followUp/triggerTurn）。
 //   - session:send 通道已废弃（0.928.0 下 agent 活跃期恒 session_busy；v2 app steer 被归属校验封死）。
 //
-// v2 plugin 协议（manifestVersion=2）：
+// plugin 协议（legacy 形态，manifest 不写 manifestVersion）：
 //   - entry 字段入口（不是顶层 tools/cards/routes）。
 //   - host 调 `new a()` + `c.ctx = e.ctx` + `c.register = (l) => {...}` + `c.onload()`。
 //   - 不依赖任何外部包（host 不在 community 槽自动安装 node_modules）。
@@ -93,16 +93,13 @@ export default class HanaDownloaderPlugin {
       // 3-b) 注册 agent/pre-step 真同步注入 adjudicator。
       //      宿主在「下一条 LLM API 请求组装前」dispatch agent/pre-step；我们在这一步把 pending
       //      队列里的 hana-background-result 拼进 messages，agent 无需收束当前会话即可感知。
-      dbgLog(`DBG hooks probe | ctx.hooks=${typeof ctx?.hooks} onDecision=${typeof ctx?.hooks?.onDecision} | globalThis.__sessionHooks=${typeof globalThis.__sessionHooks}`);
+      dbgLog(`DBG hooks probe | ctx.hooks=${typeof ctx?.hooks} onDecision=${typeof ctx?.hooks?.onDecision}`);
       let hooksApi = null;
       let hooksSource = "none";
       try {
         if (ctx.hooks && typeof ctx.hooks.onDecision === "function") {
           hooksApi = ctx.hooks;
           hooksSource = "ctx.hooks";
-        } else if (globalThis.__sessionHooks && typeof globalThis.__sessionHooks.onDecision === "function") {
-          hooksApi = globalThis.__sessionHooks;
-          hooksSource = "globalThis.__sessionHooks";
         }
       } catch (e) {
         dbgLog(`DBG hooks probe ERR: ${e?.message || e}`);
@@ -132,7 +129,7 @@ export default class HanaDownloaderPlugin {
           logger.warn?.(`agent/pre-step register failed: ${e?.message || e}`);
         }
       } else {
-        dbgLog(`DBG NO hooks channel → bridge mode (queue=${bridgeQueueDir || "n/a"})`);
+        dbgLog(`DBG NO ctx.hooks → bridge mode (queue=${bridgeQueueDir || "n/a"})`);
       }
 
       // 4) onload 恢复兜底：补调已终态 + 未投递任务的 handleFinal。

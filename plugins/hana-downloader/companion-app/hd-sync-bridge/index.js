@@ -21,7 +21,7 @@ export function apply(ctx) {
 
   try { fs.mkdirSync(queueDir, { recursive: true }); } catch (e) { log(`mkdir ERR: ${e?.message || e}`); }
 
-  // 心跳：插件入队时读它判断桥接是否在线（不在线就回退魔改通道）
+  // 心跳：插件入队时读它判断桥接是否在线（不在线时回执不写队列，直接走异步唤醒）
   let lastTouch = 0;
   const touchReady = () => {
     try {
