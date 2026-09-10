@@ -357,7 +357,7 @@
     });
     return filterMenuEl;
   }
-  function openFilterMenu(anchorEl, opts) {
+  function openFilterMenu(anchorEl, opts, ev) {
     filterMenuItems = opts;
     var menu = ensureFilterMenu();
     menu.innerHTML = "";
@@ -366,15 +366,24 @@
       o.onclick = function (e) { e.stopPropagation(); closeFilterMenu(); if (it.onclick) it.onclick(); };
       menu.appendChild(o);
     });
-    var r = anchorEl.getBoundingClientRect();
     // 先显示但用 visibility 隐藏，量取真实宽高，避免 offsetWidth=0 兜底导致偏移
     menu.style.visibility = "hidden";
     menu.style.display = "block";
     var mw = menu.offsetWidth;
     var mh = menu.offsetHeight;
-    // 下拉严格在按钮正上方居中：bottom 贴按钮 top，水平中心对齐按钮中心
+    var r = anchorEl.getBoundingClientRect();
+    // 健壮性：锚点若已脱离布局（矩形全 0），改用指针坐标定位，
+    // 否则居中计算会得到负数，被边界一把兜到最左侧。（2026-09-10）
+    if (!r.width && !r.height && ev && ev.clientX) {
+      r = { left: ev.clientX, right: ev.clientX, top: ev.clientY, bottom: ev.clientY, width: 0, height: 0 };
+    }
+    var vw = window.innerWidth || 400;
+    // 下拉优先在按钮正上方居中：bottom 贴按钮 top，水平中心对齐按钮中心
     var left = r.left + (r.width / 2) - (mw / 2);
-    if (left < 8) left = 8;
+    // 边界收敛：左右越界时贴边，但不退回 0（否则菜单会跑到卡片最左侧）
+    var maxLeft = vw - 8 - mw;
+    if (left > maxLeft) left = Math.max(8, maxLeft);
+    if (left < 8) left = Math.min(8, Math.max(0, r.left));
     var top = r.top - mh - 4;
     if (top < 8) top = r.top + r.height + 4; // 上方放不下改下方
     menu.style.left = left + "px";
@@ -442,7 +451,7 @@
           opts.push({ label: "清空失败/取消记录", onclick: function () { clearStates(["failed", "canceled", "interrupted"]); } });
         }
         if (!opts.length) return;
-        openFilterMenu(b, opts);
+        openFilterMenu(b, opts, e);
       };
       bar.appendChild(b);
     });

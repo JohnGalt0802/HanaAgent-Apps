@@ -1,62 +1,49 @@
-{  "id": "hana-downloader",
+{
+  "manifestVersion": 2,
+  "id": "hana-downloader",
   "name": "Hana Downloader",
-  "version": "0.15.1",
-  "description": "小花下载器：跨会话下载管理器，聊天内嵌实时进度卡片 + 右侧统一管理页（全部 Agent 会话的下载任务）。",
-  "author": "John Galt",
-  "minAppVersion": "0.919.4",
-  "trust": "full-access",
-  "capabilities": [
-    "task.write",
-    "task.read"
-  ],
+  "version": "0.90.1",
+  "description": "小花下载器（v2 App 版）：任意 URL 下载 + 跨会话管理器。下载引擎以 local-machine 受管程序运行，投递由宿主经 ctx.tasks 统一管理。",
   "entry": "index.js",
   "icon": "assets/icon.svg",
-  "ui": {
-    "hostCapabilities": [
-      "resource.open",
-      "resource.pick",
-      "clipboard.writeText"
-    ]
+  "minAppVersion": "0.946.2",
+  "network": {
+    "allowedHosts": [
+      "127.0.0.1"
+    ],
+    "methods": [
+      "GET",
+      "POST"
+    ],
+    "allowLocalhost": true,
+    "defaultTimeoutMs": 30000,
+    "maxResponseBytes": 5242880
   },
+  "capabilities": [
+    "app/runtime.execute",
+    "app/runtime.local-machine",
+    "app/runtime.network",
+    "app/tasks.manage",
+    "app/session.start-turn",
+    "app/tools.expose-to-model"
+  ],
   "contributes": {
     "cards": [
       {
         "id": "download",
-        "type": "webview",
         "title": "下载进度",
-        "description": "下载任务实时进度：百分比、速度、已完成量",
-        "route": "/card/download",
-        "cardForm": "flush",
-        "titlebar": null,
-        "icon": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><path d=\"M12 3v12m0 0l-4-4m4 4l4-4\"/><path d=\"M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2\"/></svg>"
+        "description": "单个下载任务的实时进度：百分比、速度、已完成量",
+        "route": "/card.html",
+        "cardForm": "flush"
       },
       {
         "id": "manager",
-        "type": "webview",
         "title": "下载管理器",
-        "description": "跨会话统一管理 Agent 的所有下载任务",
-        "route": "/manager",
+        "description": "跨会话统一管理所有下载任务",
+        "route": "/manager.html",
         "cardForm": "flush",
-        "titlebar": null,
-        "icon": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M8 9h8M8 13h5M8 17h3\"/></svg>"
+        "realization": "page"
       }
-    ],
-    "configuration": {
-      "title": "下载进度条设置",
-      "properties": {
-        "defaultSaveDir": {
-          "type": "string",
-          "default": "",
-          "title": "默认保存目录（可选）",
-          "description": "下载文件的默认保存目录（绝对路径）。留空则保存到插件数据目录 downloads/ 下。"
-        },
-        "stallTimeoutMs": {
-          "type": "number",
-          "default": 30000,
-          "title": "停滞判定阈值（毫秒）",
-          "description": "下载任务无新数据超过该时长判定为停滞（卡片 stalled 徽标 + wait 返回 stalled=true）。"
-        }
-      }
-    }
+    ]
   }
 }

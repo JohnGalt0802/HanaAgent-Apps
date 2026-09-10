@@ -1,203 +1,197 @@
-# Hana Downloader · 小花下载器
+# Hana Downloader · 小花下载器（v2 App）
 
-> 插件 ID：`hana-downloader` · 中文名：小花下载器 · 为 HanaAgent 提供**可观测下载**（observable download）能力：
-> 下载任务实时可视化、进度状态可查询、中途可干预、终态可靠通知。
-> 同时提供命令型下载（git clone / pnpm install）与跨会话下载管理器。
+> App ID：`hana-downloader` · 为 HanaAgent 提供**可观测下载**能力：
+> 下载任务实时可视化、进度可查询、中途可干预、终态可靠通知。
+> 支持 URL 下载与命令型下载（git clone / pnpm install），另有跨会话管理器。
 
-- 当前版本：v0.15.1
-- 权限要求：full-access
-- 运行环境：HanaAgent 0.946.2（实测基线）；同步投递走配套 v2 app 正门（`companion-app/hd-sync-bridge`）
+- 当前版本：v0.90.1
+- 宿主基线：HanaAgent 0.946.2（实测）
+- 形态：v2 App（单 bundle 入口 + local-machine 受管下载引擎）
 
 ---
 
-## 一、核心架构
+## 一、这是什么
 
-插件分为三层，各层职责单一、通过明确契约衔接：
+从 v1 插件形态完整迁移到 v2 App 的版本。迁移的动因是 v2 提供了
+`ctx.tasks`（宿主统一任务与投递），可以让"下载完成后通知会话"这件事
+走宿主正门，而不再依赖插件自己维护占位与注入通道。
 
-```
-┌─────────────────────────────────────────────────────┐
-│  展示层                                              │
-│  ├─ 进度卡片（聊天流内嵌 webview，600ms 轮询刷新）    │
-│  └─ 跨会话管理器（/manager，集中管控全部会话的任务）   │
-├─────────────────────────────────────────────────────┤
-│  工具层（LLM 消费的四个工具）                         │
-│  ├─ download-file     URL 下载（返回卡片 + taskId）   │
-│  ├─ download-command  命令型下载（git clone/pnpm）    │
-│  ├─ download-wait     回查（立即快照，不阻塞）        │
-│  └─ download-cancel   取消（来源签名 user/agent）     │
-├─────────────────────────────────────────────────────┤
-│  数据层（lib/dlcore.js 任务管理器）                    │
-│  流式下载 · 测速 · 限速 · 停滞监测 · 终态事件 · 持久化  │
-└─────────────────────────────────────────────────────┘
-```
+原有的四项能力一项不少：实时进度卡片、进度查询、取消、跨会话管理器。
 
-**层间契约**：
+---
 
-- 工具层 → 展示层：工具返回值携带 `details.card`（webview 卡片描述），宿主将其渲染在工具块正下方；卡片前端以 600ms 周期轮询 `/download/status` 刷新。
-- 数据层 → 工具层：`onceFinal(taskId)` 提供终态一次性等待原语；`onFinal/onStall` 回调驱动投递分流。
-- 工具层 → 宿主：`deferred:register/resolve` 总线通道承载跨回合投递。
-
-## 二、核心机制：v0.15.1 三通道通知
-
-下载完成通知按 agent 当前状态分两条：
-
-| agent 状态 | 投递路径 | agent 感知时机 |
-|---|---|---|
-| 未收束 | **真同步**：配套 v2 app `hd-sync-bridge` 在 `agent/pre-step` 把 HBR 拼进**下一条 LLM API 请求的 messages** | **当前轮** 下一次思考即看到 HBR |
-| 已收束 | **异步唤醒**：`deferred:register + resolve` → host dispatcher（busy→followUp，idle→triggerTurn） | 新 turn input 看到 HBR |
-
-同步超时（30s 内未被桥接消费）→ 自动降级异步，不丢回执。
-
-完整机制见 `docs/host-changelog/v0.14.0-sync-restore.md`（四场景实测 + 证据）；历史链路见 `docs/v0.11.0-真同步投递完整机制.md`。
-
-### 同步投递通道（v0.15.1：桥接单通道）
-
-plugin 形态的 `ctx` 没有 `hooks` 成员（实测 `ctx.hooks=undefined`），`agent/pre-step` 正门只对 **v2 app** 开放。v0.15.1 因此采用桥接，让两边各干擅长的：
-
-```text
-hana-downloader (plugin，宿主进程内、无沙箱)
-   └─ 下载回执 → 原子写入 {HANA_HOME}/app-data/hd-sync-bridge/queue/<key>.json
-hd-sync-bridge (v2 app，独立子进程 + 权限沙箱，持有 app/hooks.agent-pre-step)
-   └─ agent/pre-step → 读队列 → 拼进 messages → 删除文件
-```
-
-一条回执只走一条通道：`ctx.hooks`（插件被当 app 跑时才有）> 桥接。桥接靠 `ready.json` 心跳判活（120s 内有效），心跳过期时回执不写队列，直接走异步唤醒；两条通道互斥，不会双投。
-
-**配套 app 安装（必需，否则没有同步语义）**：
-
-1. 把 `companion-app/hd-sync-bridge/` 复制到 `{HANA_HOME}/apps/hd-sync-bridge/`
-2. 设置 → Apps → 批准该 app
-3. 设置 → Security → App capabilities → 打开 `app/hooks.agent-pre-step`
-
-桥接不可用时的行为：静默降级为「收束后 deferred 唤醒」，不丢回执但失去同步语义。
-
-> bundle 魔改通道已于 2026-09-10 下线（打补丁脚本已删、宿主 bundle 已还原）。
-
-### HBR 根标签 7 属性
-
-```xml
-<hana-background-result
-  task-id="..."
-  status="success|failed|aborted"
-  event-status="done|cancelled|error"
-  source="system"
-  plugin="hana-downloader"
-  type="download"
-  action="none|decide">
-...
-</hana-background-result>
-```
-
-**agent 优先看 `event-status`**（新语义），`status` 仅用于兼容宿主 interlude / 前端 detail。
-
-**取消来源溯源**：每次取消记录 `canceledBy` 来源（卡片按钮 = `user`，Agent 工具 = `agent`），贯穿快照、wait 返回值与投递消息；用户手动取消的通知附「非故障，无需自动重试或换源」提示，防止 Agent 将人为干预误判为故障。
-
-## 三、功能清单
-
-### 3.1 下载工具 download-file
-
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `url` | 是 | 下载地址（http/https） |
-| `saveDir` | 否 | 保存目录绝对路径；留空用插件默认目录 |
-| `fileName` | 否 | 自定义文件名；留空从 URL 推断 |
-| `speedLimit` | 否 | 限速（字节/秒） |
-| `startDelayMs` | 否 | 准备态延迟（毫秒），默认 0 |
-
-返回文本自足、含任务 ID 与免回查引导。网络策略：代理优先（CONNECT 隧道），失败自动降级直连。完整性红线：chunked（无 Content-Length）传输半途断连一律判 failed 并删除半成品。
-
-### 3.2 命令型下载 download-command
-
-`git-clone` 与 `pnpm-install` 白名单命令（不做 shell 拼接），解析输出流映射为阶段文案与百分比；Windows 下以 taskkill 杀进程树取消。
-
-### 3.3 回查工具 download-wait
-
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `taskId` | 是 | 任务 ID |
-
-立即返回当前事实快照（state / percent / speed / eta / error / filePath / stalled / consumedByWait / deferredAutoRegistered），不阻塞。**可选回查，不强制**：任务未完成时可直接收束，下载完成会自动唤醒；若想主动确认进度或提前拿终态，可调用本工具。
-
-### 3.4 取消工具 download-cancel
-
-终止指定任务（来源签名为 agent），删除半成品文件。
-
-### 3.5 跨会话管理器
-
-`/manager` 页面集中展示所有会话的下载任务：列表、筛选（全部/在途/已完成/失败）、搜索、行内详情、打开文件/所在文件夹、默认下载目录设置。
-
-布局与配色（v0.14.0）：卡片底色与滚动条优先取宿主注入的 CSS 变量（`--bg-card` / `--text-muted`），未注入时退回自包含双色板；列表用 flex 高度链（`#dl-root` 列布局 + `.mgr-list` `flex:1 / min-height:0 / overflow-y:auto`）在视口内滚动，不再依赖宿主卡片高度上限的硬编码值。
-
-## 四、设置项
-
-| 设置 | 默认 | 说明 |
-|------|------|------|
-| `defaultSaveDir` | 空 | 默认保存目录，留空用插件数据目录 downloads/ |
-| `stallTimeoutMs` | 30000 | 停滞判定阈值（毫秒） |
-| `waitWatchMode` | false | wait 守望模式开关；当前默认快照模式（wait 立即返回，Agent 收束后由 deferred 自动唤醒） |
-
-## 五、项目结构
+## 二、架构
 
 ```
-manifest.json                插件声明（full-access）
-index.js                     生命周期：onload 注册 agent/pre-step adjudicator（order 999）+ 遗留任务恢复
-lib/delivery.js              投递权威：tailSettled / buildEntry 7 属性 / enqueueSync(主动投递实时态) / injectForSession / deliverAsync
-lib/dlcore.js                任务管理器：流式下载/测速/限速/停滞监测/onceFinal/canceledBy/consumedByWait/持久化
-lib/deferred.js              deferred 占位 helper（register/resolve + 全局 bus 兜底）
-lib/progress-parsers.js      git/pnpm 输出解析（纯函数）
-tools/download-file.js       URL 下载工具（创建即注册占位）
-tools/download-command.js    命令型下载工具（创建即注册占位）
-tools/download-wait.js       回查工具（立即快照）
-tools/download-cancel.js     取消工具
-routes/download.js           卡片页/管理器页/status/list/cancel/prepare/reveal/settings 路由
-app/card.css|card.js         进度卡片前端（自包含色板、折叠交互、报高）
-app/manager.css|manager.js   跨会话管理器前端
-docs/host-changelog/0.938.12-bridge-sync-verified.md  桥接方案落地与实测（权威）
-docs/host-changelog/0.938.12-hooks-gate-v2app.md      v2 app hooks 正门实测
-companion-app/hd-sync-bridge/                          配套 v2 app（同步投递正门）
-docs/host-changelog/v0.14.0-sync-restore.md  魔改通道机制与实测
-docs/card-width-and-container.md   聊天流卡片宽度与容器约束（实测）
-docs/host-bundle-mods.md      宿主魔改重建手册（内部，含本机路径，不入公开库）
-docs/v0.11.0-真同步投递完整机制.md   历史机制文档（v1 契约时代）
+┌───────────────────────────────────────────────────────────┐
+│  展示层（ui/，跑在 App iframe 里）                          │
+│  ├─ card.html / card.js     进度卡片（聊天流内嵌）           │
+│  └─ manager.html / manager.js 跨会话管理器                   │
+│      └─ hdboot.js：适配层，把旧请求重写到引擎 API             │
+├───────────────────────────────────────────────────────────┤
+│  App 层（index.js，宿主 AppHost 子进程）                     │
+│  ├─ 注册四个工具（download-file/command/wait/cancel）        │
+│  ├─ 拉起并管理受管下载引擎（ctx.runtime）                     │
+│  ├─ 投递：拿到 callToken → ctx.tasks.create → 完成后 complete │
+│  └─ 路由：/engine/* 转发前端请求到引擎                        │
+├───────────────────────────────────────────────────────────┤
+│  引擎层（engine/，local-machine 受管程序）                    │
+│  ├─ server.js   HTTP 服务（127.0.0.1:4317）                  │
+│  ├─ dlcore.js   任务管理器（流式下载/测速/限速/停滞/持久化）    │
+│  └─ progress-parsers.js  git / pnpm 输出解析                 │
+└───────────────────────────────────────────────────────────┘
+```
+
+**为什么要一个独立的受管引擎**：v2 App 的子进程受 Node Permission Model 约束，
+不能裸 `fetch`、也不能任意落盘。只有 `profile: "local-machine"` 的受管程序
+才能保住"任意 URL + 任意落盘目录"这两个原有能力。
+
+**App 与引擎怎么通信**：App 侧经 `ctx.network.fetch` 访问 `127.0.0.1:4317`。
+不用 `ctx.runtime.start({ service })` 的回环服务代理——那条路会留一条常驻 RPC，
+卡死工具回包（详见 `docs/踩坑记录.md` 第 4 条）。
+
+---
+
+## 三、安装
+
+```bash
+# 开发期：把整个目录放进宿主 apps/
+cp -r hana-downloader-app  ~/.hanako/apps/hana-downloader
+
+# 重载
+curl -X POST http://127.0.0.1:14500/api/extensions/app:hana-downloader/reload \
+  -H "Authorization: Bearer <token>"      # token 见 ~/.hanako/server-info.json
+```
+
+需要在宿主「设置 → 应用」里逐项授权以下能力：
+
+| capability | 用途 |
+| --- | --- |
+| `app/runtime.execute` | 拉起受管引擎 |
+| `app/runtime.local-machine` | 让引擎以本机权限运行（任意 URL / 任意落盘） |
+| `app/runtime.network` | 受管引擎出网 |
+| `app/tasks.manage` | 建/结算宿主任务，完成结果投递给会话 |
+| `app/session.start-turn` | 会话投递 |
+| `app/tools.expose-to-model` | 把工具暴露给模型 |
+
+另需清单顶层 `network`（`allowedHosts: ["127.0.0.1"]` + `allowLocalhost: true`），
+供 App 侧 `ctx.network.fetch` 访问本机引擎。
+
+---
+
+## 四、工具
+
+| 工具 | 用途 | 关键参数 |
+| --- | --- | --- |
+| `download-file` | URL 下载，发起即返回 taskId | `url`（必填）、`saveDir`、`fileName` |
+| `download-command` | 命令型下载 | `kind`（`git-clone` / `pnpm-install`）、`repo`、`targetDir`、`workdir`、`label` |
+| `download-wait` | 查进度快照（立即返回、不阻塞） | `taskId` |
+| `download-cancel` | 取消下载 | `taskId` |
+
+工具返回值统一为 `{ content: [{ type: "text", text }], details }`；
+`details.card` 触发聊天流内嵌卡片，`details.download` 带结构化快照。
+
+下载完成后由宿主经 `ctx.tasks` 把结果投递回发起会话，模型无需轮询。
+
+### 命令型的两条边界
+
+- 只认 `git-clone` 与 `pnpm-install` 两种，不接受任意命令。
+- 不做 shell 拼接，全部数组传参；Windows 下 pnpm 的 `.cmd` shim 会被解析到真实
+  JS 入口，用当前 node 执行，避开 `shell:false` 的 EINVAL。
+
+---
+
+## 五、引擎 HTTP API
+
+引擎监听 `127.0.0.1:4317`，路径避开了 `/download/*` 前缀（宿主保留段）。
+
+```
+GET  /ping                                健康检查
+POST /download    { url, fileName?, saveDir?, speedLimit?, stallTimeoutMs?, sessionPath? }
+POST /command     { kind, repo?, targetDir?, workdir?, label?, sessionPath? }
+GET  /wait?taskId=xxx                     进度快照
+POST /wait        { taskId }              同上（POST 版，宿主路由对带 query 的路径不友好）
+POST /cancel      { taskId, source? }     取消
+POST /cancel-all                          取消全部
+GET  /list                                全部任务
+POST /clear                               清理终态任务
+POST /reveal      { filePath }            在系统文件管理器中定位
+GET|POST /settings                        读写引擎设置
+GET  /events                              SSE：终态 / 停滞事件流
+```
+
+App 侧的转发入口（给前端用）：
+
+```
+GET /api/apps/hana-downloader/routes/engine/<path>   → 引擎 /<path>
+GET /api/apps/hana-downloader/routes/engine-base     → {"ok":true,"base":"engine"}
+GET /api/apps/hana-downloader/routes/engine-status   → 受管运行时状态
 ```
 
 ---
 
-## 六、安装
+## 六、目录结构
 
-### 方式一：宿主安装入口（推荐分发）
-
-1. 拿到分发包 `hana-downloader-<version>.zip`，先解压出 `hana-downloader/` 文件夹；
-2. HanaAgent → 扩展中心 → 「本地安装」，选择该**文件夹**（安装入口认目录，不直接吃 zip）；
-3. 确认审查卡，批准；
-4. 重启宿主（legacy 插件没有热重载）。
-
-> 包内 `manifest.json` **不写 `manifestVersion`**，走宿主的 legacy 插件通道（staged 结果 `runtime: "v1"`）。
-> 若写成 `manifestVersion: 2`，安装入口会按 v2 App 规范严格校验（`contributes.configuration`、卡片 `type` 等字段都会被拒），这条包就装不上。
-
-### 方式二：手动放置
-
-把 `hana-downloader/` 整个目录放进 `~/.hanako/plugins/`，重启宿主。
-
-### 配套 app（同步投递正门）
-
-`companion-app/hd-sync-bridge/` 是独立的 v2 app，需单独装到 `~/.hanako/apps/`，并在「设置 → Apps → App 能力」授权 `app/hooks.agent-pre-step`。缺了它，同步投递会退回 deferred 异步唤醒。
-
----
-
-## 七、重启与调试
-
-```powershell
-# 重启宿主（重启后插件重新加载；bundle 魔改已于 2026-09-10 下线）
-pwsh -File <workspace>\_tools\restart-hana\restart-hana-reliable.ps1
+```
+hana-downloader-app/
+├── manifest.json            v2 清单（capabilities / network / contributes.cards）
+├── index.js                 入口：工具注册、引擎管理、投递、路由
+├── assets/icon.svg
+├── engine/
+│   ├── server.js            受管引擎 HTTP 服务
+│   ├── dlcore.js            下载内核（从插件时代复用，纯 Node 无宿主依赖）
+│   └── progress-parsers.js  git / pnpm 输出解析
+├── ui/
+│   ├── card.html / card.js / card.css        进度卡片
+│   ├── manager.html / manager.js / manager.css  跨会话管理器
+│   └── hdboot.js            适配层（旧请求 → 引擎 API）
+└── docs/
+    ├── 踩坑记录.md                   迁移过程中踩到的坑与解法（含 3 条宿主通用结论）
+    ├── 七象限测试报告-20260910.md    投递能力验收
+    └── hana-app卡片尺寸与身份反馈.md  给宿主开发者：卡片尺寸锁死与卡外按钮无身份
 ```
 
-同步投递只走桥接 app 一条通道（`companion-app/hd-sync-bridge`）；它不在线时自动回退 deferred 异步唤醒。bundle 魔改通道已废弃并移除，旧手册 `docs/host-bundle-mods.md` 仅作历史参考。
-
-**调试日志**（运行时写，不影响功能）：
-- 插件数据目录 `v2-load-debug.log`：onload / hooks probe / **INJECTED**（同步投递判据）
-- 宿主日志搜索 `[hd-sync-bridge]`：`adjudicator registered` / `INJECT n item(s)`
+引擎数据目录：`{HANA_HOME}/app-data/hana-downloader/`
+（`tasks.json` 任务快照、`finished/*.json` 终态结果、`speed-cache.json` 测速缓存）。
 
 ---
 
-*作者：John Galt*
+## 七、界面
+
+两处 UI 决定值得记下。
+
+**聊天流卡片**。卡宽由宿主限定（任务族统一宽度 `--chat-task-block-width: 348px`，
+详见「已知限制」），因此首行只放两个高频操作：
+
+- URL 任务完成态：`打开` + `文件夹`
+- 命令型任务完成态：`打开文件夹`（目录无「打开文件」语义）
+
+`复制路径` 下沉到展开详情里的「操作」行，与「路径」行相邻，想复制时目光本来就在路径上。
+
+**滚动条**。管理器列表的滚动条对齐宿主原生卡片（工作台卡等）：
+宽度 4px、滑块 `rgba(128, 128, 128, 0.2)`、悬停 `.4`、圆角 2px、两端按钮隐藏；
+同时写 `scrollbar-width: thin` 与 `scrollbar-color`，兼顾 Firefox。
+
+## 八、状态机
+
+任务状态：`pending` → `running` → `done` / `failed` / `canceled` / `interrupted`
+
+- URL 任务取消后保留 `.part` 半成品供断点续传；
+- `git-clone` 任务失败/取消时清理半成品目录（避免留下不完整仓库）；
+- `pnpm-install` 保留 `node_modules` 半成品。
+
+---
+
+## 九、已知限制
+
+- 命令型仅支持 `git-clone` / `pnpm-install`，不做通用命令执行。
+- 引擎监听固定端口 4317；多个实例同时运行会冲突（重载时会先停掉本 App 的遗留实例）。
+- 进度卡片依赖前端轮询引擎，慢网络下刷新有延迟。
+- **聊天流内嵌卡片的宽度上限由宿主卡壳决定**（宽度 = 卡壳 `clientWidth`，随窗口浮动，
+  小窗口实测 347px、大窗口 937px）；`hana.ui.resize({ width })` 没有接收方，
+  页面只能"窄于上限"不能"宽于上限"。卡片布局按窄宽设计：首行只放徽章与操作按钮，
+  进度与元信息分行；`html` / `body` / 根容器显式 `width:100%` 以免自行收缩。
+  参见 `docs/hana-app卡片尺寸与身份反馈.md` 与 `docs/踩坑记录.md` 第 6 条。
+- 中途停滞（`stalled`）状态无法主动投递给模型：v2 任务模型是「一次 execute → 一条终态
+  通知」，`ctx.tasks.create` 需要当前有效的 `callToken`，而 `callToken` 只在 execute 期间
+  有效。目前改为引擎落盘 `stalled/*.json` 供前端展示，不惊动模型。
