@@ -4,7 +4,7 @@
 > 下载任务实时可视化、进度状态可查询、中途可干预、终态可靠通知。
 > 同时提供命令型下载（git clone / pnpm install）与跨会话下载管理器。
 
-- 当前版本：v0.15.0
+- 当前版本：v0.15.1
 - 权限要求：full-access
 - 运行环境：HanaAgent 0.946.2（实测基线）；同步投递走配套 v2 app 正门（`companion-app/hd-sync-bridge`）
 
@@ -37,7 +37,7 @@
 - 数据层 → 工具层：`onceFinal(taskId)` 提供终态一次性等待原语；`onFinal/onStall` 回调驱动投递分流。
 - 工具层 → 宿主：`deferred:register/resolve` 总线通道承载跨回合投递。
 
-## 二、核心机制：v0.15.0 三通道通知
+## 二、核心机制：v0.15.1 三通道通知
 
 下载完成通知按 agent 当前状态分两条：
 
@@ -50,9 +50,9 @@
 
 完整机制见 `docs/host-changelog/v0.14.0-sync-restore.md`（四场景实测 + 证据）；历史链路见 `docs/v0.11.0-真同步投递完整机制.md`。
 
-### 同步投递通道（v0.15.0：桥接单通道）
+### 同步投递通道（v0.15.1：桥接单通道）
 
-plugin 形态的 `ctx` 没有 `hooks` 成员（实测 `ctx.hooks=undefined`），`agent/pre-step` 正门只对 **v2 app** 开放。v0.15.0 因此采用桥接，让两边各干擅长的：
+plugin 形态的 `ctx` 没有 `hooks` 成员（实测 `ctx.hooks=undefined`），`agent/pre-step` 正门只对 **v2 app** 开放。v0.15.1 因此采用桥接，让两边各干擅长的：
 
 ```text
 hana-downloader (plugin，宿主进程内、无沙箱)

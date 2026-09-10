@@ -1,6 +1,6 @@
 {  "id": "hana-downloader",
   "name": "Hana Downloader",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "小花下载器：跨会话下载管理器，聊天内嵌实时进度卡片 + 右侧统一管理页（全部 Agent 会话的下载任务）。",
   "author": "John Galt",
   "minAppVersion": "0.919.4",

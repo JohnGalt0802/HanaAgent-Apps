@@ -1,6 +1,6 @@
-// index.js — hana-downloader v0.15.0 v2 plugin lifecycle（零依赖版 + 桥接同步投递）
+// index.js — hana-downloader v0.15.1 v2 plugin lifecycle（零依赖版 + 桥接同步投递）
 //
-// 投递架构（v0.15.0，宿主 0.946.2）：
+// 投递架构（v0.15.1，宿主 0.946.2）：
 //   - lib/delivery.js 是唯一投递权威：订阅 mgr.onFinal/onStall。
 //   - 真同步注入：配套 v2 app hd-sync-bridge 持有官方 agent/pre-step 正门，宿主在下一条
 //     LLM API 请求组装前 dispatch，桥接把回执拼进 messages → 未收束会话的 agent 下一次
@@ -88,7 +88,7 @@ export default class HanaDownloaderPlugin {
         log: logger,
         bridgeQueueDir,
       });
-      dbgLog(`DBG delivery created (v0.15.0: bridge + sync inject + deferred fallback)`);
+      dbgLog(`DBG delivery created (v0.15.1: bridge + sync inject + deferred fallback)`);
 
       // 3-b) 注册 agent/pre-step 真同步注入 adjudicator。
       //      宿主在「下一条 LLM API 请求组装前」dispatch agent/pre-step；我们在这一步把 pending
@@ -154,8 +154,8 @@ export default class HanaDownloaderPlugin {
         dbgLog(`ONLOAD-RECOVER loop ERR: ${e?.message || e}`);
       }
 
-      logger.info?.(`hana-downloader v0.15.0 v2 loaded (delivery: bridge/sync inject + deferred)`);
-      dbgLog(`DBG hana-downloader v0.15.0 v2 loaded`);
+      logger.info?.(`hana-downloader v0.15.1 v2 loaded (delivery: bridge/sync inject + deferred)`);
+      dbgLog(`DBG hana-downloader v0.15.1 v2 loaded`);
     } catch (e) {
       logger.warn?.(`hana-downloader restore failed: ${e?.message || e}`);
       dbgLog(`DBG ERR: ${e?.message || e}`);

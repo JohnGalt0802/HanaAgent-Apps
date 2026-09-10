@@ -102,7 +102,7 @@ export async function registerDeferred(bus, task, extraMeta = {}, keyOverride = 
   }
 }
 
-const FINAL_RESOLVE_DELAY_MS = 2_000; // 终态后延迟复查窗口：覆盖 wait 续注册后、agent 收束前可能的小幅回查间隙。
+const FINAL_RESOLVE_DELAY_MS = 0; // 终态后立即复查（原先 2000ms 是为了避开 wait 回查竞态，但复查本身是同步的、且 consumedByWait 判定已足够去重，故降为 0：对话收束后立即通知）
 // v0.5.7 语义：占位由 wait 快照「未完成时续注册」（agent 收束前最后动作），会话内完成（已终态）不注册不投递。
 // 此窗口只兜底「续注册后任务完成、agent 恰好又回查拿到终态」的窄间隙（wait 消费 → 复查跳过），
 // 不再承担「等 agent 干完别的再回查」的大窗口（那是创建即注册时代的问题，已随注册时机后移消除）。
