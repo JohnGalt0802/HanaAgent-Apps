@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-downloader",
   "name": "Hana Downloader",
-  "version": "0.90.1",
+  "version": "0.90.2",
   "description": "小花下载器（v2 App 版）：任意 URL 下载 + 跨会话管理器。下载引擎以 local-machine 受管程序运行，投递由宿主经 ctx.tasks 统一管理。",
   "entry": "index.js",
   "icon": "assets/icon.svg",

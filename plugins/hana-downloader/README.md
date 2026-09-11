@@ -4,7 +4,7 @@
 > 下载任务实时可视化、进度可查询、中途可干预、终态可靠通知。
 > 支持 URL 下载与命令型下载（git clone / pnpm install），另有跨会话管理器。
 
-- 当前版本：v0.90.1
+- 当前版本：v0.90.2
 - 宿主基线：HanaAgent 0.946.2（实测）
 - 形态：v2 App（单 bundle 入口 + local-machine 受管下载引擎）
 
