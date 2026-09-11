@@ -569,8 +569,31 @@
         .catch(function () { hint("设置失败：网络错误"); });
     };
 
+    var opt3 = el("button", "mgr-settings-opt", "停滞判定阈值（当前：" + (settings.stallTimeoutMs || 30000) + " ms）");
+    opt3.title = "下载无新数据超过该时长判定为停滞（卡片显示 stalled 徐标）";
+    opt3.onclick = function (e) {
+      e.stopPropagation(); // 防止外部点击监听误关菜单
+      var cur = settings.stallTimeoutMs || 30000;
+      var v = window.prompt("停滞判定阈值（毫秒）", String(cur));
+      if (v == null) return;
+      var n = parseInt(v, 10);
+      if (!isFinite(n) || n <= 0) { hint("请输入大于 0 的毫秒数"); return; }
+      apiFetch("/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stallTimeoutMs: n }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.ok) { settings = data.settings; renderSettingsOptions(menu); closeSettingsMenu(); hint("已设置停滞阈值 " + n + " ms"); }
+          else hint("设置失败：" + (data.error || "未知错误"));
+        })
+        .catch(function () { hint("设置失败：网络错误"); });
+    };
+
     menu.appendChild(opt1);
     menu.appendChild(opt2);
+    menu.appendChild(opt3);
   }
 
   function loadSettings(cb) {

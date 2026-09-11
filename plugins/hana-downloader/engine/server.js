@@ -17,8 +17,15 @@ const PORT = Number(process.env.HD_ENGINE_PORT || 4317);
 const READY_MARKER = "HD_ENGINE_READY";
 // dataDir 由 app 经 args 传入（受管程序的 cwd 不保证指向 app 数据目录）
 const DATA_DIR = process.argv[2] || process.env.HD_ENGINE_DATA_DIR || process.cwd();
+const CFG_FILE = path.join(DATA_DIR, "engine-config.json");
 
 const log = (s) => { try { console.log(`[hd-engine] ${s}`); } catch {} };
+
+// 全局设置（engine-config.json）：defaultSaveDir / agentChooses / stallTimeoutMs。
+// 由管理器的设置菜单经 POST /settings 写入，下载时作为缺省值生效。
+function loadCfg() {
+  try { return JSON.parse(fs.readFileSync(CFG_FILE, "utf8")) || {}; } catch { return {}; }
+}
 
 const mgr = getTaskManager(DATA_DIR);
 try { mgr.restore(); } catch (e) { log(`restore ERR ${e?.message || e}`); }
@@ -108,12 +115,16 @@ const server = http.createServer(async (req, res) => {
     const b = await readBody();
     if (!b.url) return send(400, { error: "url required" });
     try {
+      const cfg = loadCfg();
+      // 默认保存目录：任务未显式指定时套用全局设置。
+      // agentChooses=true 表示“由助手每次决定”，此时不套用固定目录。
+      const cfgSaveDir = (!b.saveDir && !cfg.agentChooses && cfg.defaultSaveDir) ? String(cfg.defaultSaveDir) : null;
       const t = await mgr.create({
         url: b.url,
         fileName: b.fileName || undefined,
-        saveDir: b.saveDir || undefined,
+        saveDir: b.saveDir || cfgSaveDir || undefined,
         speedLimit: b.speedLimit || undefined,
-        stallTimeoutMs: b.stallTimeoutMs || undefined,
+        stallTimeoutMs: b.stallTimeoutMs || cfg.stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
         kind: "url",
       });
@@ -158,7 +169,7 @@ const server = http.createServer(async (req, res) => {
         fileName,
         filePath,
         saveDir: path.dirname(filePath),
-        stallTimeoutMs: b.stallTimeoutMs || undefined,
+        stallTimeoutMs: b.stallTimeoutMs || loadCfg().stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
       });
       log(`created command ${t?.taskId} | ${kind} ${fileName}`);
@@ -212,19 +223,15 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === "/settings") {
-    const cfgFile = path.join(DATA_DIR, "engine-config.json");
     if (req.method === "GET") {
-      let cfg = {};
-      try { cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8")); } catch {}
-      return send(200, { ok: true, settings: cfg });
+      return send(200, { ok: true, settings: loadCfg() });
     }
     if (req.method === "POST") {
       const b = await readBody();
       try {
-        const cur = (() => { try { return JSON.parse(fs.readFileSync(cfgFile, "utf8")); } catch { return {}; } })();
-        const next = { ...cur, ...(b && typeof b === "object" ? b : {}) };
+        const next = { ...loadCfg(), ...(b && typeof b === "object" ? b : {}) };
         fs.mkdirSync(DATA_DIR, { recursive: true });
-        fs.writeFileSync(cfgFile, JSON.stringify(next, null, 2), "utf8");
+        fs.writeFileSync(CFG_FILE, JSON.stringify(next, null, 2), "utf8");
         return send(200, { ok: true, settings: next });
       } catch (e) { return send(500, { error: String(e?.message || e) }); }
     }

@@ -172,6 +172,15 @@ hana-downloader-app/
 宽度 4px、滑块 `rgba(128, 128, 128, 0.2)`、悬停 `.4`、圆角 2px、两端按钮隐藏；
 同时写 `scrollbar-width: thin` 与 `scrollbar-color`，兼顾 Firefox。
 
+**设置菜单**。管理器工具条上的文件夹按钮里有三项，写入引擎数据目录的
+`engine-config.json`，下载时作为缺省值生效：
+
+| 项 | 作用 |
+| --- | --- |
+| 设置默认下载目录 | 所有未显式指定 `saveDir` 的下载落到这里 |
+| 助手选择下载地址 | 反过来，由 Agent 每次决定；固定目录不套用 |
+| 停滞判定阈值 | 无新数据超过该毫秒数判定为停滞（默认 30000） |
+
 ## 八、状态机
 
 任务状态：`pending` → `running` → `done` / `failed` / `canceled` / `interrupted`
@@ -195,3 +204,30 @@ hana-downloader-app/
 - 中途停滞（`stalled`）状态无法主动投递给模型：v2 任务模型是「一次 execute → 一条终态
   通知」，`ctx.tasks.create` 需要当前有效的 `callToken`，而 `callToken` 只在 execute 期间
   有效。目前改为引擎落盘 `stalled/*.json` 供前端展示，不惊动模型。
+
+---
+
+## 十、v1 遗留清理（2026-09-11）
+
+从 v1 插件整机迁到 v2 App 之后，宿主里还挂着一批过渡期的东西，已一并清掉。
+
+**卸载的 app**
+
+| app | 作用 | 处置 |
+| --- | --- | --- |
+| `hd-sync-bridge` | 过渡期的“回执桥”：v1 插件把下载回执写成队列文件，这个 app 在 `agent/pre-step` 把队列拼进消息 | 移除 |
+| `rt-probe` | 验证 local-machine 运行时与 `ctx.tasks` 能力的探针 | 移除 |
+| `_disabled-sync-probe-*` | 更早的探针残骸 | 移除 |
+
+桥为什么曾经需要：v1 插件有“任意 URL / 任意落盘 / spawn”这些宽能力，但没有 hooks 正门；
+app 有 hooks 正门，却受权限沙箱约束。两边各取所长，才有了“插件写队列 + app 注入”的绕行。
+整机迁成 v2 App 后 `ctx.tasks` 直接可用，桥就失去了意义。
+
+**卡片侧的旧凭据**
+
+`card.js` / `manager.js` 里还留着 v1 时代的 `LOOPBACK_TOKEN`（URL 上的 `token=`）与
+`X-Hana-Plugin-Surface-Session` 头，与 `hdboot.js` 的 v2 票据（`appSurfaceSession` →
+`X-Hana-App-Surface-Session`）重复。v2 下 URL 不带 `token`，那段逻辑恒为空，是死代码。
+现在凭据统一由 hdboot 注入，业务代码不再自管。
+
+**验证**：宿主重启后管理器卡连续 `fwd GET /list -> 200`，链路正常。
