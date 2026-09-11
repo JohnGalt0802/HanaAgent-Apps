@@ -43,8 +43,8 @@
 
   var API = window.__API || "";
   var pageParams = new URLSearchParams(location.search);
-  var LOOPBACK_TOKEN = pageParams.get("token") || "";
-  var SURFACE_SESSION = pageParams.get("pluginSurfaceSession") || "";
+  // 凭据：统一由 hdboot.js 包在 window.fetch 上注入（X-Hana-App-Surface-Session）。
+  // 旧插件时代的 token / pluginSurfaceSession 逻辑已删除（2026-09-11 清理）。
 
   var POLL_MS = 3000;
   var tasks = [];
@@ -54,17 +54,11 @@
   var settings = {}; // 插件设置（defaultSaveDir / agentChooses）
 
   function apiUrl(path) {
-    var url = API + path;
-    if (LOOPBACK_TOKEN) {
-      url += (url.indexOf("?") === -1 ? "?" : "&") + "token=" + encodeURIComponent(LOOPBACK_TOKEN);
-    }
-    return url;
+    return API + path;
   }
 
   function apiFetch(path, init) {
-    var headers = new Headers(init && init.headers);
-    if (SURFACE_SESSION) headers.set("X-Hana-Plugin-Surface-Session", SURFACE_SESSION);
-    return fetch(apiUrl(path), Object.assign({}, init || {}, { headers: headers }));
+    return fetch(apiUrl(path), Object.assign({}, init || {}));
   }
 
   // ── mini host SDK ──

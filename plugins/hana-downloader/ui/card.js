@@ -54,25 +54,19 @@
   var API = window.__API || "";
   var pageParams = new URLSearchParams(location.search);
   var taskId = (root && root.dataset.task) || pageParams.get("taskId") || "";
-  // iframe 由宿主以带凭据的 URL 加载：本地连接带 token query，远程连接带 pluginSurfaceSession
-  var LOOPBACK_TOKEN = pageParams.get("token") || "";
-  var SURFACE_SESSION = pageParams.get("pluginSurfaceSession") || "";
+  // 凭据：iframe 由宿主以带凭据的 URL 加载，v2 App 的票据是 appSurfaceSession。
+  // 票据统一由 hdboot.js 包在 window.fetch 上注入（X-Hana-App-Surface-Session），
+  // 这里不再自带旧插件时代的 token / pluginSurfaceSession 逻辑（2026-09-11 清理）。
   // v2 App：contributes.cards[].route 不允许带 query，聊天流卡的 route 固定是 /card.html，
   // 所以这里通常拿不到 taskId。不再因此报错，而是让 /download/status 不带 taskId 请求，
   // 由引擎回退到“最近任务”（running/pending 优先），拿到快照后再回填 taskId。
 
   function apiUrl(path) {
-    var url = API + path;
-    if (LOOPBACK_TOKEN) {
-      url += (url.indexOf("?") === -1 ? "?" : "&") + "token=" + encodeURIComponent(LOOPBACK_TOKEN);
-    }
-    return url;
+    return API + path;
   }
 
   function apiFetch(path, init) {
-    var headers = new Headers(init && init.headers);
-    if (SURFACE_SESSION) headers.set("X-Hana-Plugin-Surface-Session", SURFACE_SESSION);
-    return fetch(apiUrl(path), Object.assign({}, init || {}, { headers: headers }));
+    return fetch(apiUrl(path), Object.assign({}, init || {}));
   }
 
   // ── mini host SDK ──
