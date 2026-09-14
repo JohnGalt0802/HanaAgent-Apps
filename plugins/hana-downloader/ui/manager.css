@@ -54,9 +54,11 @@ html, body {
   /* 视口约束：内容自适应但不超过 iframe 可视高，列表在剩余空间内滚动。
      不用固定 max-height（宿主视口一变就裁死），也不用 height:100%（宿主高度若跟随报高会循环）。 */
   max-height: 100vh;
-  /* 背景：宿主卡片底色（--bg-card，工作台/面板卡片那一层），退而求其次用主背景 --bg，
-     再退到自包含色板。宿主已实测会向 iframe 注入变量。 */
-  background: var(--bg-card, var(--bg, var(--mgr-bg, #FCFAF5)));
+  /* 背景：**透明**，底色交给宿主卡片容器（2026-09-14）。
+     原先这里自己铺 var(--bg-card, …) 兜底 #FCFAF5，结果叠在宿主容器上反而显得“带一层底色”，
+     因为宿主主题 CSS 并不注入 iframe，--bg-card 取不到，实际落到的 #FCFAF5 与容器色并非同一层。
+     参照 llama-monitor（同样是宿主卡片里的 App）：body 透明，只给内部区块用变量。 */
+  background: transparent;
 }
 
 /* 滚动条：对齐宿主原生卡片（工作台卡等）

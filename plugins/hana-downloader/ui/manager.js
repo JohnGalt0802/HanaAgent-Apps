@@ -29,6 +29,35 @@ import { hana } from "./assets/sdk.js";
 
   try { hana.ready(); } catch (e4) { /* ready 失败不阻塞渲染 */ }
 
+  // ── 配色诊断（2026-09-14）──
+  // 用途：确认管理器底色与宿主原生卡片是否一致。
+  // 关键点：宿主主题 CSS 并不会注入 iframe，所以 var(--bg-card, …) 实际走兜底值；
+  // 这里把“兜底值 vs 真实计算值 vs 变量是否定义”一次性报出来。
+  setTimeout(function () {
+    try {
+      var root = document.getElementById("dl-root");
+      var rootBg = root ? getComputedStyle(root).backgroundColor : null;
+      var bodyBg = getComputedStyle(document.body).backgroundColor;
+      // 探针：用一个隐藏元素读 --bg-card，未定义则得到 #000
+      var probe = document.createElement("div");
+      probe.style.cssText = "position:absolute;visibility:hidden;background:var(--bg-card,#000)";
+      document.body.appendChild(probe);
+      var bgCard = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      var mgrBg = getComputedStyle(document.documentElement).getPropertyValue("--mgr-bg").trim();
+      var themeSnap = null;
+      try { themeSnap = hana.theme?.getSnapshot?.() || null; } catch (e5) { themeSnap = null; }
+      hana.track?.("diag", {
+        rootBg: rootBg,
+        bodyBg: bodyBg,
+        bgCardVar: bgCard,
+        mgrBgVar: mgrBg || null,
+        dark: document.body.classList.contains("t-dark"),
+        theme: themeSnap ? JSON.stringify(themeSnap) : null,
+      });
+    } catch (e6) { /* 诊断失败不影响主流程 */ }
+  }, 1200);
+
   var POLL_MS = 3000;
   var tasks = [];
   var filter = "all"; // all | active | done | failed
