@@ -20,7 +20,7 @@ const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
 const CHUNK_SLEEP_MIN_MS = 1;  // 限速时 chunk 间最小等待
 
 let _instance = null;
-const MGR_VER = 20; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v20=加 clearByStates/cancelAll）
+const MGR_VER = 21; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -817,6 +817,47 @@ class TaskManager {
     }
     this._persist();
     return { ok: true, removed };
+  }
+
+  // ── 删除单条记录（v0.90.3：管理器行内菜单「删除记录 / 删除记录及文件」）──
+  // opts.deleteFile = true 时连同磁盘产物一起删：
+  //   - url 任务删 filePath 与残留的 .part
+  //   - git-clone 任务删 targetDir（本次克隆出来的目录树）
+  //   - pnpm-install 任务不删任何东西（filePath 就是用户的工作目录，误删不可逆）
+  // 在途任务（running/pending）拒绝删除，必须先取消。
+  forget(taskId, opts = {}) {
+    const t = this.tasks.get(taskId);
+    if (!t) return { ok: false, error: "任务不存在" };
+    if (t.state === "running" || t.state === "pending") {
+      return { ok: false, error: "任务仍在进行中，请先取消再删除" };
+    }
+    const wantFile = !!opts.deleteFile;
+    let fileDeleted = false;
+    let fileSkipped = null;
+    let fileError = null;
+    if (wantFile) {
+      if (t.kind === "command") {
+        const dir = t.cmd && t.cmd.targetDir ? t.cmd.targetDir : null;
+        if (t.cmd && t.cmd.type === "git-clone" && dir) {
+          try {
+            if (fs.existsSync(dir)) { fs.rmSync(dir, { recursive: true, force: true }); fileDeleted = true; }
+          } catch (e) { fileError = String(e?.message || e); }
+        } else {
+          fileSkipped = "该任务为依赖安装，只删除记录，不删除工作目录";
+        }
+      } else {
+        const targets = [t.filePath, t.partPath || (t.filePath ? t.filePath + ".part" : null)].filter(Boolean);
+        for (const p of targets) {
+          try {
+            if (fs.existsSync(p)) { fs.unlinkSync(p); if (p === t.filePath) fileDeleted = true; }
+          } catch (e) { fileError = String(e?.message || e); }
+        }
+        if (!fileDeleted && !fileError) fileSkipped = "磁盘上没有找到对应的文件";
+      }
+    }
+    this.tasks.delete(taskId);
+    this._persist();
+    return { ok: true, taskId, fileDeleted, fileSkipped, fileError };
   }
 
   // ── 全部取消在途（v0.8.9：管理器“全部取消”按钮）──

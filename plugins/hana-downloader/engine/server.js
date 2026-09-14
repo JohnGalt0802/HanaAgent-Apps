@@ -30,6 +30,34 @@ function loadCfg() {
 const mgr = getTaskManager(DATA_DIR);
 try { mgr.restore(); } catch (e) { log(`restore ERR ${e?.message || e}`); }
 
+// ── 卡片绑定表（bindings.json）──
+// 见下方 /bind、/register-card 两个端点。
+const BIND_FILE = path.join(DATA_DIR, "bindings.json");
+function loadBind() {
+  try {
+    const j = JSON.parse(fs.readFileSync(BIND_FILE, "utf8"));
+    const db = {
+      pending: j.pending || {},
+      bind: j.bind || {},
+      assigned: j.assigned || {},
+      rounds: j.rounds || {},
+      stable: j.stable || {},
+    };
+    // 迁移：早期版本只有 bind 表、没有 assigned 标记。不补的话，升级后第一次认领
+    // 会把一个已经发过卡的老任务当成“新任务”再发一遍（实测过）。
+    if (!Object.keys(db.assigned).length && Object.keys(db.bind).length) {
+      for (const tid of Object.values(db.bind)) db.assigned[tid] = true;
+    }
+    return db;
+  } catch { return { pending: {}, bind: {}, assigned: {}, rounds: {}, stable: {} }; }
+}
+function saveBind(db) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(BIND_FILE, JSON.stringify(db), "utf8");
+  } catch (e) { log(`saveBind ERR ${e?.message || e}`); }
+}
+
 // ── 事件流（SSE）──
 const clients = new Set();
 function broadcast(obj) {
@@ -75,6 +103,90 @@ const server = http.createServer(async (req, res) => {
   const readBody = async () => { let raw = ""; for await (const c of req) raw += c; try { return JSON.parse(raw || "{}"); } catch { return {}; } };
 
   if (req.method === "GET" && u.pathname === "/ping") return send(200, { ok: true, pid: process.pid, ts: Date.now() });
+
+  // ── 卡片绑定 ─────────────────────────────────────────────────
+  // 聊天流卡由宿主的 messageRenderers 通道投影出来，卡片 iframe 拿不到投递消息的
+  // payload，也就不知道自己是哪个任务。所以绑定关系由本引擎维护：
+  //   pending  taskId -> { sessionId, title, seq }   已投递、等卡片来认领的任务
+  //   bind     cardInstanceId -> taskId              已经认领过的卡片
+  // cardInstanceId 由宿主铸造、重新投影后不变，所以会话重载不会串任务。
+  if (req.method === "POST" && u.pathname === "/register-card") {
+    const b = await readBody();
+    if (!b.taskId) return send(400, { error: "taskId required" });
+    const db = loadBind();
+    db.pending[String(b.taskId)] = {
+      sessionId: b.sessionId ? String(b.sessionId) : null,
+      title: b.title ? String(b.title) : null,
+      seq: Number(b.seq) || Date.now(),
+    };
+    // 投递时指定的稳定卡片实例 id：卡片跨会话重载后靠它直接认人，不依赖顺序推断。
+    if (b.cardInstanceId) db.stable[String(b.cardInstanceId)] = String(b.taskId);
+    saveBind(db);
+    log(`register-card ${b.taskId} | session=${b.sessionId || "-"} | card=${b.cardInstanceId || "-"}`);
+    return send(200, { ok: true });
+  }
+
+  if (req.method === "POST" && u.pathname === "/bind") {
+    const b = await readBody();
+    const cardId = String(b.cardInstanceId || "").trim();
+    const sessionId = b.sessionId ? String(b.sessionId) : null;
+    const sidKey = sessionId || "__global__";
+    if (!cardId) return send(400, { error: "cardInstanceId required" });
+
+    const db = loadBind();
+    // 0) 投递时指定的稳定实例 id：最确定的一条路（跨重载不变）
+    if (db.stable[cardId]) {
+      const tid = db.stable[cardId];
+      db.bind[cardId] = tid;
+      db.assigned[tid] = true;
+      saveBind(db);
+      log(`bind ${cardId} -> ${tid} (stable)`);
+      return send(200, { ok: true, taskId: tid, matched: "stable" });
+    }
+    // 1) 已经认领过：幂等返回（同一次 iframe 生命周期内重复请求走这里）
+    if (db.bind[cardId]) return send(200, { ok: true, taskId: db.bind[cardId], matched: "cache" });
+
+    // 本会话的任务序列，按投递先后排
+    const all = Object.entries(db.pending)
+      .filter(([, v]) => !sessionId || v.sessionId === sessionId)
+      .map(([tid, v]) => ({ taskId: tid, ...v }))
+      .sort((a, z) => (a.seq || 0) - (z.seq || 0));
+
+    if (!all.length) {
+      // 池子空（手工打开卡片 / 本会话没有待认领任务）：退回“在途优先、否则最近一条”
+      try {
+        const list = mgr.list() || [];
+        const active = list.filter((t) => t && (t.state === "running" || t.state === "pending"));
+        const pick = active[0] || list[list.length - 1];
+        if (pick?.taskId) return send(200, { ok: true, taskId: pick.taskId, matched: "fallback" });
+      } catch (e) { log(`bind fallback ERR ${e?.message || e}`); }
+      return send(404, { error: "no task to bind", cardInstanceId: cardId });
+    }
+
+    // 2) 优先分配“从未被分配过”的任务——增量场景（刚发起的新下载就是这种）
+    let hit = all.find((p) => !db.assigned[p.taskId]);
+    let matched = "new";
+
+    // 3) 所有任务都分配过了：说明卡片在会话重载后重新加载了。
+    //    注意：cardInstanceId 在实时投影与历史投影下并不相同，所以不能靠它跨重载认人。
+    //    这里改成按顺序轮转：重载时所有卡片几乎同时请求，先到的拿更老的任务，
+    //    而 iframe 的加载顺序就是消息顺序，所以能对上。
+    if (!hit) {
+      const now = Date.now();
+      let round = db.rounds[sidKey];
+      if (!round || now - (round.at || 0) > 8000) round = db.rounds[sidKey] = { at: now, i: 0 };
+      round.at = now;
+      hit = all[round.i % all.length];
+      round.i += 1;
+      matched = "rotate";
+    }
+
+    db.bind[cardId] = hit.taskId;
+    db.assigned[hit.taskId] = true;
+    saveBind(db);
+    log(`bind ${cardId} -> ${hit.taskId} (${matched})`);
+    return send(200, { ok: true, taskId: hit.taskId, matched });
+  }
 
   if (req.method === "GET" && u.pathname === "/list") {
     let tasks = [];
@@ -212,6 +324,18 @@ const server = http.createServer(async (req, res) => {
     try {
       const r = mgr.clearByStates(b.states || ["done", "failed", "canceled", "interrupted"]);
       return send(200, { ok: true, ...r });
+    } catch (e) { return send(500, { error: String(e?.message || e) }); }
+  }
+
+  // 删除单条记录（deleteFile=true 时连同磁盘产物一起删；详见 TaskManager.forget）
+  if (req.method === "POST" && u.pathname === "/forget") {
+    const b = await readBody();
+    if (!b.taskId) return send(400, { error: "taskId required" });
+    try {
+      const r = mgr.forget(b.taskId, { deleteFile: !!b.deleteFile });
+      if (!r.ok) return send(400, { error: r.error || "删除失败" });
+      log(`forget ${b.taskId} | deleteFile=${!!b.deleteFile} | fileDeleted=${r.fileDeleted}`);
+      return send(200, r);
     } catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 

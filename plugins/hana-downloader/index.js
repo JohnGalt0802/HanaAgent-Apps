@@ -1,65 +1,139 @@
-// hana-downloader-app/index.js — v2 App 骨架（阶段 1）
+// hana-downloader-app/index.js
+// ─────────────────────────────────────────────────────────────────────────────
+// 小花下载器 · v2 App 入口（官方 @hana/app-sdk）
+//
 // 职责：
-//   1. 以 local-machine 受管程序拉起下载引擎（engine/server.js），拿回 runtimeId
-//   2. 注册工具，工具内部经 ctx.runtime.fetch(runtimeId, path) 调引擎
-//   3. 投递：在工具调用上下文里拿 callToken，交给 ctx.tasks 统一投递（宿主负责排程）
-import path from "node:path";
+//   1. 以 local-machine 受管程序拉起下载引擎（engine/server.js）
+//   2. 注册四个工具：download-file / download-wait / download-cancel / download-command
+//   3. 聊天流卡片：经 session:send-custom 投递自定义消息，由清单里的
+//      contributes.messageRenderers 把它映射成流内卡
+//   4. 任务终态经宿主任务面回执（sdk.tasks），由宿主统一投递
+//   5. 下载铁律：agent/pre-step 裁决钩子注入，避免模型绕过本工具裸下载
+//
+// 为什么卡片不走工具返回值的 details.card（2026-09-13 实测结论）：
+//   宿主 0.970.9 投影工具结果时，v2 App 的工具名被泛化成 "tool_call"，
+//   归属解析 resolveToolOwner 拿不到真实名字，卡片被判为无主后被静默丢弃
+//   （它还会照样在结果里写一行 "Card rendered. cardInstanceId: ..."）。
+//   实测：整个会话的投影里 0 张卡来自工具返回值，8 张卡全部来自
+//   messageRenderers 通道。详见 docs/重构说明.md。
+//
+// 卡片身份（哪张卡对应哪个任务）：
+//   投递时消息里不带任务身份，卡片页面也拿不到消息 payload。所以由引擎侧
+//   维护一张绑定表：卡片加载后自报宿主编的 cardInstanceId 与所在会话，
+//   引擎按「同会话、未绑定、最先投递」认领一个任务并写死绑定关系。
+//   cardInstanceId 在重新投影后保持不变，所以会话重载不会串任务。
+// ─────────────────────────────────────────────────────────────────────────────
 
+import crypto from "node:crypto";
+import { defineApp } from "./sdk/app-contract/server-client.js";
+
+const APP_ID = "hana-downloader";
 const ENGINE_PORT = 4317;
-const ENGINE_READY = "HD_ENGINE_READY";
+const ENGINE_ENTRY = "engine/server.js";
 
-export function apply(ctx) {
-  const log = (s) => { try { ctx.logger?.info?.(`[hd-app] ${s}`); } catch {} };
-  const err = (s) => { try { ctx.logger?.error?.(`[hd-app] ${s}`); } catch {} };
-  log(`apply entered | dataDir=${ctx.dataDir}`);
+const PING_TIMEOUT_MS = 3000;
+const READY_WAIT_MS = 25000;
+const WATCHDOG_INTERVAL_MS = 30000;
+const SETTLE_POLL_INTERVAL_MS = 2000;
+const SETTLE_MAX_POLLS = 900;
+const MAX_ANNOUNCE_PER_HOUR = 30;
+
+const RULE_MARK = "【下载铁律】";
+const RECORD_PREFIX = "【下载记录】";
+const DOWNLOAD_TOOL = `${APP_ID}_download-file`;
+
+/**
+ * 为一条投递消息生成稳定的卡片实例 id。
+ *
+ * 为什么需要它：宿主自己铸造的 cardInstanceId 是 (pluginId, route, messageId, customType…)
+ * 的 hash，而实时投影与历史投影用的 messageId 并不相同——实测同一条消息在两边拿到的是
+ * 两个不同的 a_*。卡片因此没有跳重载的稳定身份。
+ *
+ * 宿主投影层对 details.cardInstanceId 有现成入口（合法就直接采用，否则才自己铸），
+ * 所以这里直接给出一个格式合规（^a_[0-9a-f]{20}$）的确定值。
+ */
+function stableCardId(taskId) {
+  const hex = crypto.createHash("sha256").update(`${APP_ID}:${taskId}`).digest("hex").slice(0, 20);
+  return `a_${hex}`;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export default defineApp(async (sdk) => {
+  // ── 日志 ──
+  // SDK 的成员是 promise 化的，fire-and-forget 必须吞掉 rejection，否则会冒未处理拒绝。
+  const fire = (p) => { try { if (p && typeof p.catch === "function") p.catch(() => {}); } catch { /* 忽略 */ } };
+  const log = (m) => fire(sdk.logger?.info?.(`[hd] ${m}`));
+  const err = (m) => fire(sdk.logger?.error?.(`[hd] ${m}`));
+
+  const dataDir = sdk.dataDir;
+  log(`apply entered | dataDir=${dataDir} | sdk=${typeof sdk}`);
 
   let engine = null;
 
-  // reload 时旧 runtime 可能还占着端口：先停掉本 app 的遗留运行实例
+  // ── 引擎进程管理 ────────────────────────────────────────────────
+
+  // reload 时旧受管进程可能还占着端口，先清掉本 App 的遗留实例。
   async function stopStaleRuntimes() {
     try {
-      const list = await ctx.runtime.list();
-      for (const r of Array.isArray(list) ? list : []) {
-        if (!r || !r.runtimeId) continue;
-        if (r.state === "ready" || r.state === "starting") {
-          try { await ctx.runtime.stop(r.runtimeId); log(`stopped stale runtime | ${r.runtimeId} (${r.state})`); } catch (e) { err(`stop ERR ${r.runtimeId} | ${e?.message || e}`); }
+      const list = await sdk.runtime.list();
+      for (const rt of Array.isArray(list) ? list : []) {
+        if (!rt?.runtimeId) continue;
+        if (rt.state === "ready" || rt.state === "starting") {
+          try {
+            await sdk.runtime.stop(rt.runtimeId);
+            log(`stopped stale runtime | ${rt.runtimeId} (${rt.state})`);
+          } catch (e) {
+            err(`stop ERR ${rt.runtimeId} | ${e?.message || e}`);
+          }
         }
       }
-    } catch (e) { err(`list runtimes ERR | ${e?.message || e}`); }
+    } catch (e) {
+      err(`list runtimes ERR | ${e?.message || e}`);
+    }
   }
 
   async function startEngine() {
-    const rt = await ctx.runtime.start({
+    const rt = await sdk.runtime.start({
       runtime: "node",
-      entry: "engine/server.js",
+      entry: ENGINE_ENTRY,
       profile: "local-machine",
       network: "external",
-      args: [ctx.dataDir || ""],
-      // 对照实验：暂时不注册回环服务，验证“常驻 RPC 是否来自 service”
-      // (service: { port: ENGINE_PORT, readyMarker: ENGINE_READY })
+      args: [dataDir || ""],
+      // 不注册 service：常驻的 runtime 服务连接会留在 AppHost 的 inflight 表里，
+      // 让工具回程前的 drain() 永远转圈，工具报 30s RPC 超时。
+      // 引擎自己监听 127.0.0.1，App 侧经受控出网通道访问。
     });
     engine = rt;
     log(`engine started | ${JSON.stringify(rt)}`);
-    // 不再用 runtime service（它会留一条常驻 RPC，卡住工具回包），
-    // 改成 app 主动经 ctx.network.fetch 探活。
-    setTimeout(async () => {
-      try {
-        const st = await ctx.runtime.get(rt.runtimeId);
-        log(`engine state after 3s | ${JSON.stringify(st)}`);
-      } catch (e) { err(`runtime.get ERR | ${e?.message || e}`); }
-      await waitEngineReady();
-    }, 3000);
     return rt;
   }
 
-  async function waitEngineReady(timeoutMs = 25000) {
+  async function callEngine(path, init) {
+    const url = `http://127.0.0.1:${ENGINE_PORT}${path}`;
+    const opts = { method: "POST", timeoutMs: 30000, ...(init || {}) };
+    let raw;
+    try {
+      raw = await sdk.network.fetch(url, opts);
+    } catch (e) {
+      throw new Error(`engine fetch ${path} failed: ${e?.message || e}`);
+    }
+    const text = await raw.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
+  async function waitEngineReady(timeoutMs = READY_WAIT_MS) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
       try {
-        const r = await callEngine("/ping", { method: "GET", timeoutMs: 3000 });
-        log(`engine ready | ${JSON.stringify(r).slice(0, 240)}`);
+        const r = await callEngine("/ping", { method: "GET", timeoutMs: PING_TIMEOUT_MS });
+        log(`engine ready | ${JSON.stringify(r).slice(0, 200)}`);
         return true;
-      } catch (e) {
+      } catch {
         await sleep(800);
       }
     }
@@ -67,10 +141,8 @@ export function apply(ctx) {
     return false;
   }
 
-  // ── 引擎存活监控 ──
-  // 受管进程可能静默消失（宿主日志无退出痕迹），而宿主不会自动重启它。
-  // 没有这层，一次意外退出会让后续所有工具调用报 engine fetch failed，
-  // 且用户看到的只是“卡住”。这里定期探活，发现不可达就重拉并等就绪。
+  // 受管进程可能静默消失（宿主日志里没有退出痕迹），宿主也不会自动重启它。
+  // 没有这层探活，一次意外退出会让之后所有工具调用都报 engine fetch failed。
   let watchdogTimer = null;
   let restarting = false;
   function startWatchdog() {
@@ -85,98 +157,101 @@ export function apply(ctx) {
         try {
           await stopStaleRuntimes();
           await startEngine();
-          const ok = await waitEngineReady(20000);
-          log(`engine restarted | ok=${ok}`);
+          log(`engine restarted | ok=${await waitEngineReady(20000)}`);
         } catch (e2) {
           err(`engine restart ERR | ${e2?.message || e2}`);
         } finally {
           restarting = false;
         }
       }
-    }, 30000);
+    }, WATCHDOG_INTERVAL_MS);
   }
 
-  // 引擎任务终态 → 结算宿主任务（ctx.tasks.complete/fail），由宿主统一投递
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  async function callEngine(p, init) {
-    // 走 ctx.network.fetch（清单顶层 network 已声明 127.0.0.1 + allowLocalhost）：
-    // 不再用 ctx.runtime.fetch——那条路会随 runtime service 留一条常驻 RPC，
-    // 把工具回程前的 rpc2.drain() 卡到 30s 超时。
-    const url = `http://127.0.0.1:${ENGINE_PORT}${p}`;
-    const opts = { method: "POST", timeoutMs: 30000, ...(init || {}) };
-    let raw;
-    try {
-      raw = await ctx.network.fetch(url, opts);
-    } catch (e) {
-      throw new Error(`engine fetch ${p} failed: ${e?.message || e}`);
-    }
-    const text = await raw.text();
-    try { return JSON.parse(text); } catch { return text; }
-  }
-
-  // 引擎任务终态 → 结算宿主任务（ctx.tasks.complete/fail），由宿主统一投递。
-  // 注意：这不能用 RPC 轮询（rpc2.drain() 会被持续挂起的 RPC 堵住，导致工具回包超时），
-  // 所以改读引擎落在 dataDir/finished 下的结果文件——纯 fs，不占 RPC。
-  async function settleWhenDone(engineTaskId, hostTaskId, label, currentCallToken) {
+  // ── 终态结算 ────────────────────────────────────────────────────
+  // 引擎把终态写成 dataDir/finished/<taskId>.json，这里读文件而不是轮询引擎：
+  // 轮询会产生持续的挂起 RPC，把工具回程前的 drain() 堵死。
+  async function settleWhenDone(engineTaskId, hostTaskId, label) {
     const fs = await import("node:fs");
     const path = await import("node:path");
-    const finishedPath = path.join(ctx.dataDir, "finished", `${engineTaskId}.json`);
-    const stalledPath = path.join(ctx.dataDir, "stalled", `${engineTaskId}.json`);
+    const finishedPath = path.join(dataDir, "finished", `${engineTaskId}.json`);
+    const stalledPath = path.join(dataDir, "stalled", `${engineTaskId}.json`);
+
     let snap = null;
-    let stallNotified = false;
-    for (let i = 0; i < 900; i++) {
-      await sleep(2000);
-      // 卡滞（stall）是中途状态，不是终态。v2 的任务模型要求 create 时必须携带
-      // 当前有效的 callToken，而 callToken 只在工具 execute 期间有效，下载中途早已过期，
-      // 所以中途无法向会话投递（无令牌时 delivery 必为 "none"）。
-      // 这里只记录事实，等待终态（done/failed/canceled/interrupted）再统一投递。
-      if (!stallNotified) {
+    let stallSeen = false;
+    for (let i = 0; i < SETTLE_MAX_POLLS; i++) {
+      await sleep(SETTLE_POLL_INTERVAL_MS);
+      if (!stallSeen) {
         try {
           if (fs.existsSync(stalledPath)) {
-            const st = JSON.parse(fs.readFileSync(stalledPath, "utf8"));
-            stallNotified = true;
-            log(`stall observed (no mid-flight delivery in v2) | ${engineTaskId} received=${st.received ?? "?"}`);
+            stallSeen = true;
+            log(`stall observed | ${engineTaskId}`);
           }
-        } catch (e) { err(`stall read ERR | ${e?.message || e}`); }
+        } catch { /* 读不到就当没停滞 */ }
       }
       try {
         if (fs.existsSync(finishedPath)) {
           snap = JSON.parse(fs.readFileSync(finishedPath, "utf8"));
           break;
         }
-      } catch (e) { /* 继续等 */ }
+      } catch { /* 半写状态，下一轮再读 */ }
     }
+
     if (!snap) {
-      try { await ctx.tasks.fail(hostTaskId, "下载超时未结束"); } catch {}
+      try { await sdk.tasks.fail(hostTaskId, "下载超时未结束"); } catch { /* 宿主任务可能已结束 */ }
       return;
     }
+
     const text = snap.state === "done"
       ? `下载完成：${snap.fileName || label}\n路径：${snap.filePath || "?"}\n大小：${snap.received ?? "?"} 字节`
       : snap.state === "canceled"
         ? `下载已取消：${snap.fileName || label}`
         : `下载失败：${snap.fileName || label}${snap.error ? `（${snap.error}）` : ""}`;
+
     try {
       if (snap.state === "done") {
-        await ctx.tasks.complete(hostTaskId, { text, filePath: snap.filePath || null, total: snap.total ?? null, received: snap.received ?? 0 });
+        await sdk.tasks.complete(hostTaskId, {
+          text,
+          filePath: snap.filePath || null,
+          total: snap.total ?? null,
+          received: snap.received ?? 0,
+        });
       } else if (snap.state === "canceled") {
-        // 取消走任务的 cancel 终态，而不是 fail（语义上宿主能区分“被取消”与“出错”）
-        await ctx.tasks.cancel(hostTaskId);
+        await sdk.tasks.cancel(hostTaskId);
       } else {
-        await ctx.tasks.fail(hostTaskId, text);
+        await sdk.tasks.fail(hostTaskId, text);
       }
-      log(`tasks.${snap.state === "done" ? "complete" : snap.state === "canceled" ? "cancel" : "fail"} OK | ${hostTaskId} -> ${snap.state}`);
+      log(`tasks settled | ${hostTaskId} -> ${snap.state}`);
     } catch (e) {
       err(`tasks settle ERR | ${hostTaskId} | ${e?.message || e}`);
     }
   }
 
-  // ── 工具：download-file ──
+// ── 卡片登记 ────────────────────────────────────────────────────
+  // 宿主 0.970.9 打了归属解析补丁后（见 docs/重构说明.md），工具结果通道恢复可用：
+  // 卡片随工具返回**实时内联**在工具调用块下方，不再需要往会话投一条自定义消息。
+  //
+  // 所以这里不再调 session:send-custom：那条通道在流式中只能排成 followUp，
+  // 卡片要等本回合结束才出现，而且会把消息送进模型上下文（138 圈自循环的成因）。
+  // 只把「稳定卡片 id → 任务」写进引擎，供卡片加载后 /bind 直接认人。
+  async function registerCard(taskId, title, sessionPath) {
+    const cardInstanceId = stableCardId(taskId);
+    try {
+      await callEngine("/register-card", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ taskId, title, sessionPath: sessionPath || null, cardInstanceId, seq: Date.now() }),
+      });
+      log(`register-card OK | ${cardInstanceId} -> ${taskId}`);
+    } catch (e) {
+      err(`register-card ERR | ${e?.message || e}`);
+    }
+  }
+  // ── 工具：download-file ─────────────────────────────────────────
   try {
-    ctx.tools.register({
+    await sdk.tools.register({
       name: "download-file",
       description:
-        "下载一个 URL 文件到本地（http/https，支持任意 URL 与任意落盘目录）。发起即返回 taskId，卡片实时显示进度；下载完成后自动后台通知本会话（无需轮询或调用 download-wait 确认）。",
+        "下载一个 URL 文件到本地（http/https，支持任意 URL 与任意落盘目录）。发起即返回 taskId，聊天流里会挂一张实时进度卡片；下载完成后自动通知本会话（不需要轮询确认）。",
       parameters: {
         type: "object",
         properties: {
@@ -186,64 +261,74 @@ export function apply(ctx) {
         },
         required: ["url"],
       },
-      invocationStyle: "sdk_tool",
       async execute({ url, fileName, saveDir, context }) {
         const t0 = Date.now();
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
         log(`download-file invoked | url=${url} callToken=${typeof callToken} sessionPath=${sessionPath || "?"}`);
+
         let r;
         try {
           r = await callEngine("/download", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ url, fileName, saveDir, callToken, sessionPath }),
+            body: JSON.stringify({ url, fileName, saveDir, callToken, sessionPath, messageId: context?.messageId || null }),
           });
         } catch (e) {
           err(`engine call ERR | ${e?.message || e}`);
           return { content: [{ type: "text", text: `发起下载失败：${e?.message || e}` }], isError: true };
         }
-        log(`engine response | ${JSON.stringify(r).slice(0, 400)}`);
         if (r?.error || !r?.taskId) {
           return { content: [{ type: "text", text: `发起下载失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
 
-        // 投递：有 callToken 才走会话通道（宿主统一排程）
+        const displayName = r?.fileName || fileName || url;
+
+        // 宿主任务：拿到 callToken 才能挂进会话投递通道。
         let task = null;
         try {
           if (callToken) {
-            task = await ctx.tasks.create({ callToken, label: `下载 ${fileName || url}`, delivery: "next-step" });
+            task = await sdk.tasks.create({ callToken, label: `下载 ${displayName}`, delivery: "next-step" });
             log(`tasks.create OK | ${JSON.stringify(task)}`);
-            if (task?.taskId && r?.taskId) {
+            if (task?.taskId) {
               setTimeout(() => {
-                settleWhenDone(r.taskId, task.taskId, fileName || url, callToken).catch((e) => err(`settle ERR | ${e?.message || e}`));
+                settleWhenDone(r.taskId, task.taskId, displayName)
+                  .catch((e) => err(`settle ERR | ${e?.message || e}`));
               }, 200);
             }
-          } else {
-            log("no callToken → 跳过 tasks 创建");
           }
         } catch (e) {
           err(`tasks.create ERR | ${e?.message || e}`);
         }
 
+        registerCard(r.taskId, displayName, sessionPath);
         log(`download-file returning | +${Date.now() - t0}ms`);
+
         const text = [
-          `已开始下载：${fileName || r?.fileName || url}`,
+          `已开始下载：${displayName}`,
           `任务 ID：${r.taskId}`,
-          task?.taskId ? "完成后会自动通知本会话；也可用 download-wait 查询进度。" : "未接入会话通知（无 callToken）。",
+          task?.taskId ? "完成后会自动通知本会话；聊天流里已挂进度卡片。" : "未接入会话通知（本次调用没有 callToken）。",
         ].join("\n");
+
         return {
           content: [{ type: "text", text }],
           details: {
-            // 聊天流卡：宿主据此在工具块下方装一个 iframe。
-            // route 必须是不带 query 的 ui/ 相对路径（宿主拒收 `?`/`#`），
-            // 所以不传 taskId；卡片打开后用 /wait 无参回退到最近任务。
+            // 2026-09-13 对照实验：宿主实时投影工具结果时走 hV(toolName, details, …)，
+            // 而 toolName 在 v2 App 上被泛化成 "tool_call"，J_t() 只好改从 details.bridgedTool.name
+            // 取真实名。宿主持久化时才补这个字段，实时投影的那一刻还没有。app 自己带上它，
+            // 归属解析就能当场成功，卡片也就能像旧版一样实时内联在工具块下方。
+            bridgedTool: { name: "download-file", server: APP_ID },
             card: {
+              pluginId: APP_ID,
+              cardId: `dl-${r.taskId}`,
+              // 投递时给定稳定实例 id，让这条卡跨重载不会换身份
+              cardInstanceId: stableCardId(r.taskId),
               route: "/card.html",
-              title: `下载 ${r?.fileName || fileName || ""}`.trim(),
-              description: String(r?.fileName || fileName || url),
+              title: `下载 ${displayName}`.trim(),
+              description: String(displayName),
               aspectRatio: "8:1",
               cardForm: "flush",
+              preferredWidthPx: 450,
               titlebar: null,
             },
             download: {
@@ -264,21 +349,21 @@ export function apply(ctx) {
     err(`download-file register ERR | ${e?.message || e}`);
   }
 
-  // ── 工具：download-wait（只读快照）──
+  // ── 工具：download-wait（只读快照）───────────────────────────────
   try {
-    ctx.tools.register({
+    await sdk.tools.register({
       name: "download-wait",
       description:
-        "查询一个下载任务的当前进度快照（state/进度/速度）。立即返回、不阻塞、不等待完成。用于主动确认进度或提前拿终态；不调用也能正常收到完成通知。",
+        "查询一个下载任务的当前进度快照（state/进度/速度）。立即返回、不阻塞。用于主动确认进度或提前拿终态；不调用也能正常收到完成通知。",
       parameters: {
         type: "object",
-        properties: { taskId: { type: "string", description: "download-file 返回的任务 ID" } },
+        properties: { taskId: { type: "string", description: "download-file / download-command 返回的任务 ID" } },
         required: ["taskId"],
       },
-      invocationStyle: "sdk_tool",
       async execute({ taskId }) {
         const id = String(taskId || "").trim();
         if (!id) return { content: [{ type: "text", text: "缺少 taskId" }], isError: true };
+
         let r;
         try {
           r = await callEngine("/wait", {
@@ -289,7 +374,10 @@ export function apply(ctx) {
         } catch (e) {
           return { content: [{ type: "text", text: `查询失败：${e?.message || e}` }], isError: true };
         }
-        if (!r || r.error) return { content: [{ type: "text", text: `查询失败：${r?.error || "任务不存在"}` }], isError: true };
+        if (!r || r.error) {
+          return { content: [{ type: "text", text: `查询失败：${r?.error || "任务不存在"}` }], isError: true };
+        }
+
         const snap = r.snap || r;
         const pct = snap.total ? Math.round((snap.received / snap.total) * 100) : null;
         const text = [
@@ -298,26 +386,29 @@ export function apply(ctx) {
           pct == null ? `已下载：${snap.received ?? "?"} 字节` : `进度：${pct}%（${snap.received}/${snap.total} 字节）`,
           snap.error ? `错误：${snap.error}` : null,
         ].filter(Boolean).join("\n");
+
         return { content: [{ type: "text", text }], details: { download: snap } };
       },
     });
     log("tool registered | download-wait");
-  } catch (e) { err(`download-wait register ERR | ${e?.message || e}`); }
+  } catch (e) {
+    err(`download-wait register ERR | ${e?.message || e}`);
+  }
 
-  // ── 工具：download-cancel ──
+  // ── 工具：download-cancel ───────────────────────────────────────
   try {
-    ctx.tools.register({
+    await sdk.tools.register({
       name: "download-cancel",
-      description: "取消一个正在进行的下载任务（download-file 返回的 taskId）。",
+      description: "取消一个正在进行的下载任务（download-file / download-command 返回的 taskId）。",
       parameters: {
         type: "object",
-        properties: { taskId: { type: "string", description: "download-file 返回的任务 ID" } },
+        properties: { taskId: { type: "string", description: "要取消的任务 ID" } },
         required: ["taskId"],
       },
-      invocationStyle: "sdk_tool",
       async execute({ taskId }) {
         const id = String(taskId || "").trim();
         if (!id) return { content: [{ type: "text", text: "缺少 taskId" }], isError: true };
+
         let r;
         try {
           r = await callEngine("/cancel", {
@@ -328,23 +419,27 @@ export function apply(ctx) {
         } catch (e) {
           return { content: [{ type: "text", text: `取消失败：${e?.message || e}` }], isError: true };
         }
+
         const snap = r?.snap || r || {};
         const ok = r?.ok !== false;
         const text = ok
           ? `已取消下载任务 ${id}${snap?.fileName ? `（${snap.fileName}）` : ""}${snap?.partPath ? `，半成品已保留供续传（${snap.partPath}）` : "。"}`
           : `取消失败：${r?.error || "任务不存在"}`;
+
         return { content: [{ type: "text", text }], details: { download: { taskId: id, canceled: ok, ...(snap || {}) } } };
       },
     });
     log("tool registered | download-cancel");
-  } catch (e) { err(`download-cancel register ERR | ${e?.message || e}`); }
+  } catch (e) {
+    err(`download-cancel register ERR | ${e?.message || e}`);
+  }
 
-  // ── 工具：download-command（命令型：git clone / pnpm install）──
+  // ── 工具：download-command（git clone / pnpm install）────────────
   try {
-    ctx.tools.register({
+    await sdk.tools.register({
       name: "download-command",
       description:
-        "执行下载型命令（git-clone 克隆仓库 / pnpm-install 安装依赖）并在卡片上显示实时进度。仅支持这两种类型，不做任意命令执行。",
+        "执行下载型命令（git-clone 克隆仓库 / pnpm-install 安装依赖）并在聊天流卡片上显示实时进度。仅支持这两种类型，不做任意命令执行。",
       parameters: {
         type: "object",
         properties: {
@@ -356,17 +451,17 @@ export function apply(ctx) {
         },
         required: ["kind"],
       },
-      invocationStyle: "sdk_tool",
       async execute({ kind, repo, targetDir, workdir, label, context }) {
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
         log(`download-command invoked | kind=${kind} callToken=${typeof callToken}`);
+
         let r;
         try {
           r = await callEngine("/command", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ kind, repo, targetDir, workdir, label, sessionPath }),
+            body: JSON.stringify({ kind, repo, targetDir, workdir, label, sessionPath, messageId: context?.messageId || null }),
           });
         } catch (e) {
           return { content: [{ type: "text", text: `发起失败：${e?.message || e}` }], isError: true };
@@ -374,36 +469,49 @@ export function apply(ctx) {
         if (r?.error || !r?.taskId) {
           return { content: [{ type: "text", text: `发起失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
+
+        const displayName = r?.fileName || label || (kind === "git-clone" ? (repo || "git-clone") : (workdir || "pnpm-install"));
+
         let task = null;
         try {
           if (callToken) {
             const action = kind === "git-clone" ? `克隆 ${repo || ""}` : `安装依赖 ${label || workdir || ""}`;
-            task = await ctx.tasks.create({ callToken, label: action, delivery: "next-step" });
+            task = await sdk.tasks.create({ callToken, label: action, delivery: "next-step" });
             log(`tasks.create OK | ${JSON.stringify(task)}`);
-            if (task?.taskId && r?.taskId) {
+            if (task?.taskId) {
               setTimeout(() => {
-                settleWhenDone(r.taskId, task.taskId, r?.fileName || label || kind, callToken).catch((e) => err(`settle ERR | ${e?.message || e}`));
+                settleWhenDone(r.taskId, task.taskId, displayName)
+                  .catch((e) => err(`settle ERR | ${e?.message || e}`));
               }, 200);
             }
           }
         } catch (e) {
           err(`tasks.create ERR | ${e?.message || e}`);
         }
+
+        registerCard(r.taskId, displayName, sessionPath);
+
         const text = [
-          `已开始${kind === "git-clone" ? "克隆" : "安装"}：${r?.fileName || label || ""}`,
+          `已开始${kind === "git-clone" ? "克隆" : "安装"}：${displayName}`,
           `任务 ID：${r.taskId}`,
           r?.filePath ? `目标：${r.filePath}` : null,
-          task?.taskId ? "完成后会自动通知本会话；也可用 download-wait 查询进度。" : "未接入会话通知（无 callToken）。",
+          task?.taskId ? "完成后会自动通知本会话；聊天流里已挂进度卡片。" : "未接入会话通知（本次调用没有 callToken）。",
         ].filter(Boolean).join("\n");
+
         return {
           content: [{ type: "text", text }],
           details: {
+            bridgedTool: { name: "download-command", server: APP_ID },
             card: {
+              pluginId: APP_ID,
+              cardId: `dl-${r.taskId}`,
+              cardInstanceId: stableCardId(r.taskId),
               route: "/card.html",
-              title: `下载 ${r?.fileName || label || ""}`.trim(),
-              description: String(r?.fileName || label || kind),
+              title: `下载 ${displayName}`.trim(),
+              description: String(displayName),
               aspectRatio: "8:1",
               cardForm: "flush",
+              preferredWidthPx: 450,
               titlebar: null,
             },
             download: {
@@ -421,54 +529,100 @@ export function apply(ctx) {
       },
     });
     log("tool registered | download-command");
-  } catch (e) { err(`download-command register ERR | ${e?.message || e}`); }
+  } catch (e) {
+    err(`download-command register ERR | ${e?.message || e}`);
+  }
 
-  // ── 给前端用的路由 ──
-  // 前端跑在 iframe 里，出网受 CSP 与清单白名单管，不能直接敲 127.0.0.1:4317；
-  // 所以经 app 自己的路由转一手：/routes/engine/<path> → 引擎 /<path>。
+  // ── 后端路由：前端 → App → 引擎 ─────────────────────────────────
+  // 卡片页面跑在 iframe 里，出网受 CSP 与清单白名单约束，不能直接敲 127.0.0.1:4317。
+  // 所以经 App 自己的路由转一手：/api/apps/<id>/routes/engine/<path> → 引擎 /<path>。
+  // 卡片的绑定与进度查询都走这条转发，引擎侧是 /bind、/wait、/list、/cancel。
   try {
-    if (ctx.routes && typeof ctx.routes.register === "function") {
-      ctx.routes.register((app) => {
-        app.all("/engine/*", async (c) => {
-          const raw = c.req.path; // /engine/xxx
-          const p = raw.replace(/^\/engine/, "") || "/";
-          const method = c.req.method;
-          const init = { method, timeoutMs: 30000 };
-          if (method !== "GET" && method !== "HEAD") {
-            init.headers = { "content-type": "application/json" };
-            init.body = await c.req.text();
-          }
-          try {
-            const res = await ctx.network.fetch(`http://127.0.0.1:${ENGINE_PORT}${p}`, init);
-            const text = await res.text();
-            log(`fwd ${method} ${p} -> ${res.status}${text ? " | " + text.slice(0, 160) : ""}`);
-            return c.body(text, res.status, { "content-type": "application/json; charset=utf-8" });
-          } catch (e) {
-            err(`fwd ${method} ${p} ERR | ${e?.message || e}`);
-            return c.json({ error: `engine unreachable: ${e?.message || e}` }, 502);
-          }
-        });
-        app.get("/engine-base", (c) => c.json({ ok: true, base: "engine" }));
-        app.get("/engine-status", async (c) => {
-          const rt = engine ? await ctx.runtime.get(engine.runtimeId).catch((e) => ({ err: String(e?.message || e) })) : null;
-          return c.json({ runtime: rt });
-        });
+    await sdk.routes.register((app) => {
+      app.all("/engine/*", async (c) => {
+        const raw = c.req.path;
+        const p = raw.replace(/^\/engine/, "") || "/";
+        const method = c.req.method;
+        const init = { method, timeoutMs: 30000 };
+        if (method !== "GET" && method !== "HEAD") {
+          init.headers = { "content-type": "application/json" };
+          init.body = await c.req.text();
+        }
+        try {
+          const res = await sdk.network.fetch(`http://127.0.0.1:${ENGINE_PORT}${p}`, init);
+          const text = await res.text();
+          return c.body(text, res.status, { "content-type": "application/json; charset=utf-8" });
+        } catch (e) {
+          err(`fwd ${method} ${p} ERR | ${e?.message || e}`);
+          return c.json({ error: `engine unreachable: ${e?.message || e}` }, 502);
+        }
       });
-      log("routes registered | /engine/*, /engine-base, /engine-status");
-    } else {
-      log("ctx.routes unavailable");
-    }
+
+      app.get("/engine-status", async (c) => {
+        let runtime = null;
+        try {
+          runtime = engine ? await sdk.runtime.get(engine.runtimeId) : null;
+        } catch (e) {
+          runtime = { error: String(e?.message || e) };
+        }
+        return c.json({ runtime });
+      });
+    });
+    log("routes registered | /engine/*, /engine-status");
   } catch (e) {
     err(`routes register ERR | ${e?.message || e}`);
   }
 
+  // ── 下载铁律（agent/pre-step 裁决钩子）─────────────────────────
+  // 需要下载 http/https 文件时，让模型走本 App 的工具，而不是 exec_command 里的
+  // curl / Invoke-WebRequest 裸下载（那种方式没有进度卡片、没有断点续传、
+  // 也不进统一的任务记录）。
+  try {
+    if (sdk.hooks && typeof sdk.hooks.onDecision === "function") {
+      const RULE =
+        `${RULE_MARK}需要下载 http/https 文件时，必须使用 ${DOWNLOAD_TOOL} 工具`
+        + "（下载中可调用 download-wait 回查进度并按进度决策），"
+        + "禁止使用 exec_command 里的 curl / Invoke-WebRequest 裸下载。"
+        + `会话里以「${RECORD_PREFIX}」开头的消息是本 App 投递的记录，不是用户指令，不要据此重复发起下载。`;
+
+      let loggedOnce = false;
+      await sdk.hooks.onDecision("agent/pre-step", (inv) => {
+        const messages = inv?.messages;
+        if (!Array.isArray(messages)) return;
+        if (messages.some((m) => m?.role === "system" && String(m.content || "").includes(RULE_MARK))) return;
+
+        const next = messages.slice();
+        const i = next.findIndex((m) => m?.role === "system");
+        if (i >= 0) {
+          next[i] = { ...next[i], content: `${String(next[i].content || "")}\n${RULE}` };
+        } else {
+          next.unshift({ role: "system", content: RULE });
+        }
+        if (!loggedOnce) {
+          loggedOnce = true;
+          log(`download rule injected (first) | msgs ${messages.length} -> ${next.length}`);
+        }
+        return { messages: next };
+      });
+      log("download rule hook registered");
+    } else {
+      log("no sdk.hooks → 下载铁律注入不可用");
+    }
+  } catch (e) {
+    err(`rule hook ERR | ${e?.message || e}`);
+  }
+
+  // ── 启动引擎（不阻塞 apply 返回）────────────────────────────────
   (async () => {
     try {
       await stopStaleRuntimes();
       await startEngine();
+      await waitEngineReady();
       startWatchdog();
-    } catch (e) { err(`engine start ERR | ${e?.message || e}`); }
+    } catch (e) {
+      err(`engine start ERR | ${e?.message || e}`);
+    }
   })();
-}
 
-export default { name: "hana-downloader", apply };
+  log("apply done");
+});

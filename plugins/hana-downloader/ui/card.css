@@ -12,7 +12,7 @@ html, body { overflow: hidden; }
    实测 iframe 视口 937px，但 #dl-root 只有 347px（块级容器没占满），
    导致卡片只用了宿主给的三分之一宽。这里把根容器与 body 显式拉满，
    上限交给宿主信封（width flexible, max=卡壳 clientWidth）。 */
-html, body { width: 100%; }
+html, body { width: 100%; font-size: 11.5px; line-height: 1.25; } /* 2026-09-14 压薄：根字号/行高必须显式设，否则吃浏览器默认 14px/16.8px，行高压不下来 */
 #dl-root { width: 100%; display: block; }
 
 /* ── 浅色板（默认）── 自包含暖纸色（实测宿主不注入 iframe CSS 变量，不能 var(--color-*)） */
@@ -49,33 +49,34 @@ body.t-dark {
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-  font-size: 14px;
-  line-height: 1.2; /* 锁定行高因子：消除字体差异导致的隐式高度波动 */
+  font-size: 11.5px; /* 2026-09-14 压薄：原 14px，且它后写会盖掉顶部 html,body 那条根字号 */
+  line-height: 1.25; /* 锁定行高因子：消除字体差异导致的隐式高度波动 */
   color: var(--dl-text, #101012);
   background: transparent; /* 聊天流内嵌：透明融入消息流，高度贴合内容 */
-  padding: 0 0 3px; /* 顶部归零：字行与卡片抬头压到最近；左右 padding 已移交 .dl 内部 */
+  padding: 0; /* 顶部与底部归零（2026-09-14 压薄：原 padding 0 0 3px）；左右 padding 已移交 .dl 内部 */
   min-height: 0;
 }
 
 .dl { display: flex; flex-direction: column; gap: 0; overflow: hidden; width: 100%; max-width: 100%; box-sizing: border-box; padding: 0 10px; }
 
 /* ── 第一行：左侧折叠按钮组 图标 文件名 徽标 速度/剩余 右上角进度 按钮 ── */
-.dl-row { display: flex; align-items: center; gap: 10px; min-width: 0; min-height: 18px; flex-wrap: wrap; }
+.dl-row { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 0; flex-wrap: wrap; }
+/* 2026-09-14：本行现同时承载 折叠按钮组 | 徽标 | 速度·剩余·阶段(.dl-meta) | 操作按钮 */
 
 /* 文件名行已撤（用户要薄）；.dl-name 改用下方 L92 那条历史规则 */
 .dl-left { display: flex; gap: 2px; flex-shrink: 0; align-items: center; }
 .dl-fold {
-  width: 19px; height: 19px; padding: 0; border: none; cursor: pointer;
+  width: 18px; height: 18px; padding: 0; border: none; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
-  font-size: 13px; line-height: 1;
+  font-size: 12px; line-height: 1;
   color: var(--dl-text, #3B3D3F); background: transparent; border-radius: 4px;
   transition: transform 0.18s ease, background 0.15s ease, color 0.15s ease;
 }
 .dl-all {
-  width: 28px; height: 28px; padding: 0; border: none; cursor: pointer;
-  position: relative; top: -3px; /* 补偿 U+25A1 字形基线偏低 */
+  width: 18px; height: 18px; padding: 0; border: none; cursor: pointer;
+  position: relative; top: -2px; /* 补偿 U+25A1 字形基线偏低 */
   display: flex; align-items: center; justify-content: center;
-  font-size: 22px; line-height: 1;
+  font-size: 16px; line-height: 1;
   color: var(--dl-text, #3B3D3F); background: transparent; border-radius: 4px;
   transition: transform 0.18s ease, background 0.15s ease, color 0.15s ease;
 }
@@ -84,11 +85,11 @@ body {
 .dl-all.open { transform: rotate(45deg); color: var(--dl-accent, #3B82F6); }
 
 .dl-icon {
-  flex-shrink: 0; width: 22px; height: 22px; border-radius: 6px;
+  flex-shrink: 0; width: 18px; height: 18px; border-radius: 5px;
   display: flex; align-items: center; justify-content: center;
   background: var(--dl-tool-bg, rgba(0, 0, 0, 0.05));
 }
-.dl-icon svg { width: 13px; height: 13px; stroke: var(--dl-text, #3B3D3F); }
+.dl-icon svg { width: 12px; height: 12px; stroke: var(--dl-text, #3B3D3F); }
 
 .dl-name {
   flex: 0 1 auto; min-width: 0; max-width: 46%;
@@ -97,7 +98,7 @@ body {
 }
 .dl-badge {
   flex-shrink: 0;
-  font-size: 11px; line-height: 1; padding: 2px 7px; border-radius: 999px;
+  font-size: 10.5px; line-height: 1; padding: 2px 6px; border-radius: 999px;
   background: var(--dl-tool-bg, rgba(0, 0, 0, 0.06));
   color: var(--dl-text, #3B3D3F);
 }
@@ -109,11 +110,13 @@ body {
 
 .dl-meta {
   flex: 1; min-width: 0;
-  font-size: 12px; color: var(--dl-muted, #6B6F73);
+  font-size: 11.5px; line-height: 1.3; color: var(--dl-muted, #6B6F73);
   font-variant-numeric: tabular-nums;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   text-align: right;
 }
+/* 失败/中断原因占用同一位置（2026-09-14 上移），只改颜色 */
+.dl-meta.err { color: var(--dl-danger, #EF4444); }
 
 /* 右上角：进度百分比 + 已下载/总大小，推到信息行右侧、紧邻按钮之前 */
 .dl-progress-top {
@@ -125,18 +128,13 @@ body {
 /* 首行的操作按钮组：推到最右，把固定宽度的空间用满 */
 .dl-row > .dl-btn:first-of-type { margin-left: auto; }
 
-/* 元信息行（速度 · 剩余 · 阶段） */
-.dl-metarow {
-  font-size: 11px; line-height: 1.4;
-  color: var(--dl-muted, #6B6F73);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
+/* 元信息行已撤销（2026-09-14）：速度·剩余·阶段已并入 .dl-row 的 .dl-meta，卡片从三行减为两行 */
 
 /* ── 按钮 ── */
 .dl-btn {
   flex-shrink: 0;
   border: none; cursor: pointer;
-  font-size: 12px; line-height: 1; padding: 3px 10px; border-radius: 6px;
+  font-size: 11px; line-height: 1; padding: 2px 8px; border-radius: 5px;
   background: var(--dl-tool-bg, rgba(0, 0, 0, 0.06));
   color: var(--dl-text, #3B3D3F);
   transition: background 0.15s ease;
@@ -149,7 +147,7 @@ body {
 
 /* 图标按钮：完成态三个操作去文字改图标，宽度从 ~200px 降到 ~78px */
 .dl-btn.ico {
-  padding: 0; width: 24px; height: 24px;
+  padding: 0; width: 18px; height: 18px;
   display: flex; align-items: center; justify-content: center;
 }
 .dl-btn.ico svg {
@@ -161,10 +159,10 @@ body {
 .dl-btn.ico.ok { color: var(--dl-green, #22C55E); }
 
 /* ── 第二行：进度条（独占一行，拉满）── */
-.dl-row2 { display: flex; align-items: center; min-width: 0; min-height: 14px; gap: 10px; }
+.dl-row2 { display: flex; align-items: center; min-width: 0; min-height: 0; gap: 7px; }
 .dl-track {
   flex: 1 1 auto; width: 100%; min-width: 0;
-  position: relative; height: 5px; border-radius: 999px;
+  position: relative; height: 4px; border-radius: 999px;
   background: var(--dl-track, rgba(0, 0, 0, 0.07));
   overflow: hidden;
 }
@@ -186,14 +184,14 @@ body {
 
 .dl-pct {
   flex-shrink: 0;
-  min-width: 40px; text-align: right;
-  font-size: 13px; font-weight: 700;
+  min-width: 35px; text-align: right;
+  font-size: 11.5px; font-weight: 700;
   font-variant-numeric: tabular-nums; letter-spacing: -0.3px; line-height: 1;
 }
 .dl-size {
   flex-shrink: 0;
   min-width: 0; text-align: right;
-  font-size: 12px; color: var(--dl-muted, #6B6F73);
+  font-size: 11px; color: var(--dl-muted, #6B6F73);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }

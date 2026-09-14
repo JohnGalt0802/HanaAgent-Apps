@@ -411,6 +411,8 @@ html, body {
   white-space: nowrap;
 }
 .mgr-row-menu-opt:hover { background: var(--mgr-hover, rgba(0, 0, 0, 0.05)); }
+.mgr-row-menu-opt.mgr-row-menu-danger { color: var(--mgr-danger, #8B3A3A); }
+.mgr-row-menu-opt.mgr-row-menu-danger:hover { background: rgba(139, 58, 58, 0.08); }
 
 .mgr-detail {
   border-top: 1px solid var(--mgr-border-soft, rgba(0, 0, 0, 0.06));

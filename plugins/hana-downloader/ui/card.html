@@ -5,16 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
   <title>下载进度</title>
   <link rel="stylesheet" href="./card.css">
-  <script>
-    // 与旧插件一致：__API 必须在业务脚本执行前就绪（内联同步设置）。
-    // 旧版由服务端注入 window.__API="/api/plugins/<id>"；v2 的卡 route 必须指向 ui/ 静态目录，
-    // 所以这里用 location 反推本 App 的路由前缀，同步写入。
-    window.__API = location.pathname.replace(/\/ui\/.*$/, "") + "/routes/engine/";
-  </script>
 </head>
 <body>
   <div id="dl-root"></div>
-  <script src="./hdboot.js"></script>
-  <script src="./card.js"></script>
+  <!-- v2 App：模块脚本，SDK 负责票据、主题、尺寸上报与后端路由基址 -->
+  <script type="module" src="./card.js"></script>
 </body>
 </html>

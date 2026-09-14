@@ -1,50 +1,33 @@
 // manager.js — Hana 下载管理器（跨会话）
-// 轮询 /download/list 获取所有会话的下载任务，列表 + 筛选 + 详情 + 操作。
-// 与 card.js 同款 mini host SDK（@hana/plugin-sdk 协议兼容，免构建）。
+// 轮询引擎的 /list 获取所有会话的下载任务，列表 + 筛选 + 详情 + 操作。
+// v2 App：后端访问走官方 @hana/app-sdk 的 hana.api，不再劫持 window.fetch。
+
+import { hana } from "./assets/sdk.js";
 
 (function () {
   "use strict";
 
-  // 主题明暗判定：data-hana-theme（宿主传的静态值）优先，缺失时 prefers-color-scheme 兜底
-  var __th = (document.body && document.body.getAttribute("data-hana-theme")) || "";
-  var __dark = /dark|midnight|contrast|深/i.test(__th);
-  if (!__dark && (!__th || __th === "inherit")) {
-    __dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-  }
-  if (__dark) document.body.classList.add("t-dark");
-  // 主题变化监听：宿主未传静态主题时，跟随系统配色变化动态切换
-  if (window.matchMedia) {
+  // ── 主题 ──
+  // 宿主主题快照（hana.theme）；旧宿主不发主题快照时退回系统配色。
+  function syncTheme() {
+    var dark = false;
     try {
-      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function (ev) {
-        var th2 = (document.body && document.body.getAttribute("data-hana-theme")) || "";
-        if (/dark|midnight|contrast|深/i.test(th2)) { document.body.classList.add("t-dark"); return; }
-        if (th2 && th2 !== "inherit") return;
-        document.body.classList.toggle("t-dark", ev.matches);
-      });
-    } catch (e) { /* 忽略 */ }
+      var snap = hana.theme.getSnapshot() || {};
+      var label = String(snap.theme || "");
+      dark = snap.appearance === "dark" || /dark|midnight|contrast|深|夜/i.test(label);
+      if (!dark && !snap.appearance && (!label || label === "inherit")) {
+        dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      }
+    } catch (e) {
+      dark = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    }
+    document.body.classList.toggle("t-dark", dark);
+    if (typeof render === "function") { try { render(); } catch (e2) { /* 忽略 */ } }
   }
+  syncTheme();
+  try { hana.theme.subscribe(function () { syncTheme(); }); } catch (e3) { /* 订阅不可用就只留首帧 */ }
 
-  // 宿主主题切换监听：兼容不同 payload 形状，收到后更新 data-hana-theme + t-dark + 重渲染
-  window.addEventListener("message", function (ev) {
-    try {
-      var md = ev.data;
-      if (!md || typeof md !== "object") return;
-      var th = "";
-      if (md.type === "hana.theme.changed") { th = md.theme || (md.payload && md.payload.theme) || ""; }
-      else if (md.type === "theme-changed") { th = md.theme || (md.payload && md.payload.theme) || ""; }
-      else if (!th && md.theme) th = md.theme;
-      if (!th) return;
-      document.body.setAttribute("data-hana-theme", th);
-      var dark = /dark|midnight|contrast|深|夜/i.test(th);
-      document.body.classList.toggle("t-dark", dark);
-      if (typeof render === "function") { try { render(); } catch (e) { /* 忽略 */ } }
-    } catch (e3) { /* 忽略 */ }
-  });
-
-  var API = window.__API || "";
-  var pageParams = new URLSearchParams(location.search);
-  // 凭据：统一由 hdboot.js 包在 window.fetch 上注入（X-Hana-App-Surface-Session）。
-  // 旧插件时代的 token / pluginSurfaceSession 逻辑已删除（2026-09-11 清理）。
+  try { hana.ready(); } catch (e4) { /* ready 失败不阻塞渲染 */ }
 
   var POLL_MS = 3000;
   var tasks = [];
@@ -53,52 +36,54 @@
   var expanded = null; // taskId 展开详情
   var settings = {}; // 插件设置（defaultSaveDir / agentChooses）
 
-  function apiUrl(path) {
-    return API + path;
-  }
+  // ── 后端访问 ──
+  // v2 App：统一走 hana.api.fetch（SDK 自动带 iframe 的 surface session 票据，
+  // 并把路径拼成 /api/apps/<appId>/routes/<path>）。
+  // 旧插件时代的 /download/xxx 路径在这里映射到引擎端点，调用点不用改。
+  var API_MAP = {
+    "/download/list": { path: "engine/list", method: "GET" },
+    "/download/status": { path: "engine/wait", method: "POST", fromQuery: "taskId" },
+    "/download/cancel": { path: "engine/cancel", method: "POST", fromQuery: "taskId" },
+    "/download/cancel-all": { path: "engine/cancel-all", method: "POST" },
+    "/download/clear": { path: "engine/clear", method: "POST" },
+    "/download/forget": { path: "engine/forget", method: "POST" },
+    "/download/reveal": { path: "engine/reveal", method: "POST" },
+    "/settings": { path: "engine/settings", method: null },
+    "/diag": { path: "engine/ping", method: "GET" },
+  };
 
   function apiFetch(path, init) {
-    return fetch(apiUrl(path), Object.assign({}, init || {}));
-  }
+    var raw = String(path || "");
+    var qi = raw.indexOf("?");
+    var base = qi >= 0 ? raw.slice(0, qi) : raw;
+    var query = new URLSearchParams(qi >= 0 ? raw.slice(qi + 1) : "");
+    var rule = API_MAP[base] || { path: "engine" + base, method: null };
+    var body = init && init.body;
+    var opts = { method: (rule.method || (init && init.method) || "GET") };
 
-  // ── mini host SDK ──
-  var PARENT = window.parent;
-  var HOST_ORIGIN = pageParams.get("hana-host-origin") || "*";
-  var seq = 0;
-  function hostRequest(type, payload) {
-    var id = "dl-" + (++seq);
-    return new Promise(function (resolve, reject) {
-      function onMsg(e) {
-        if (e.source !== PARENT) return;
-        var m = e.data;
-        if (!m || m.id !== id || m.type !== type) return;
-        cleanup();
-        if (m.kind === "response") resolve(m.payload);
-        else if (m.kind === "error") reject(new Error((m.error && m.error.message) || "host error"));
-      }
-      function cleanup() {
-        window.removeEventListener("message", onMsg);
-        clearTimeout(timer);
-      }
-      var timer = setTimeout(function () { cleanup(); reject(new Error("host 请求超时: " + type)); }, 8000);
-      window.addEventListener("message", onMsg);
-      PARENT.postMessage(
-        { protocol: "hana.plugin.ui", version: 1, id: id, kind: "request", type: type, payload: payload },
-        HOST_ORIGIN
-      );
-    });
+    if (rule.fromQuery) {
+      // 旧式 query 调用 → 引擎只吃 JSON body
+      var obj = {};
+      query.forEach(function (v, k) { obj[k] = v; });
+      if (body) { try { Object.assign(obj, JSON.parse(body)); } catch (e) { /* body 不是 JSON 就忽略 */ } }
+      opts.method = "POST";
+      opts.headers = { "content-type": "application/json" };
+      opts.body = JSON.stringify(obj);
+    } else if (body) {
+      opts.body = body;
+      opts.headers = (init && init.headers) || { "content-type": "application/json" };
+    }
+    return hana.api.fetch(rule.path, opts);
   }
 
   function reportSize() {
     try {
       var h = Math.ceil(document.body ? document.body.scrollHeight : 0);
       if (!h || h < 60) h = 60;
-      // 高度不设插件侧上限：报告真实内容高度，由宿主（卡片上限 600）决定最终尺寸
-      PARENT.postMessage(
-        { protocol: "hana.plugin.ui", version: 1, kind: "event", type: "ui.resize", payload: { width: 400, height: h } },
-        HOST_ORIGIN
-      );
-    } catch (e) { /* 忽略 */ }
+      try { hana.ui.resize({ height: h }); } catch (e) { /* 老宿主没有这路 */ }
+      // 兜底：0.970.9 的部分挂载位只认这条顶层高度消息
+      try { window.parent.postMessage({ type: "hana.card-resize", height: h }, "*"); } catch (e2) { /* 忽略 */ }
+    } catch (e3) { /* 忽略 */ }
   }
 
   // ── 格式化 ──
@@ -302,12 +287,15 @@
   function ensureRowMenu() {
     if (rowMenuEl) return rowMenuEl;
     rowMenuEl = el("div", "mgr-row-menu");
-    var opt1 = el("button", "mgr-row-menu-opt", "打开文件");
-    opt1.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) openFile(t); };
-    var opt2 = el("button", "mgr-row-menu-opt", "打开所在文件夹");
-    opt2.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) reveal(t); };
+    var opt1 = el("button", "mgr-row-menu-opt", "打开所在文件夹");
+    opt1.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) reveal(t); };
+    var opt2 = el("button", "mgr-row-menu-opt", "删除记录");
+    opt2.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) forgetTask(t, false); };
+    var opt3 = el("button", "mgr-row-menu-opt mgr-row-menu-danger", "删除记录及文件");
+    opt3.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) forgetTask(t, true); };
     rowMenuEl.appendChild(opt1);
     rowMenuEl.appendChild(opt2);
+    rowMenuEl.appendChild(opt3);
     document.body.appendChild(rowMenuEl);
     // 全局点击关闭
     document.addEventListener("click", function (ev) {
@@ -518,8 +506,8 @@
     opt1.title = "设置后所有文件统一下载到这里";
     opt1.onclick = function (e) {
       e.stopPropagation(); // 防止外部点击监听误关菜单
-      // 宿主目录选择（resource.pick / mode=directory）；宿主不可用时回退 prompt
-      hostRequest("resource.pick", { mode: "directory" })
+      // 宿主目录选择（hana.resources.pick / mode=directory）；宿主不可用时回退 prompt
+      hana.resources.pick({ mode: "directory" })
         .then(function (res) {
           var dir = res && res.resources && res.resources[0] && res.resources[0].path;
           if (!dir) return;
@@ -630,6 +618,28 @@
       .then(function (d) { if (d && !d.ok) hint((d.error) || "打开文件夹失败"); })
       .catch(function () { hint("打开文件夹失败：网络错误"); });
   }
+  // 删除单条记录；deleteFile=true 时连同磁盘产物一起删（服务端守护在途任务与工作目录）
+  function forgetTask(t, deleteFile) {
+    if (!t) return;
+    if (t.state === "running" || t.state === "pending") { hint("任务仍在进行中，请先取消再删除"); return; }
+    if (deleteFile) {
+      var nm = t.fileName || t.filePath || "该文件";
+      if (!window.confirm("删除记录并同时删除文件？\n\n" + nm + "\n\n此操作不可恢复。")) return;
+    }
+    apiFetch("/download/forget", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ taskId: t.taskId, deleteFile: !!deleteFile }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok) { hint((d && d.error) || "删除失败"); return; }
+        if (d.fileError) hint("记录已删除，文件删除失败：" + d.fileError);
+        else if (d.fileSkipped) hint("已删除记录，" + d.fileSkipped);
+        else hint(deleteFile ? "已删除记录及文件" : "已删除记录");
+        poll();
+      })
+      .catch(function () { hint("删除失败：网络错误"); });
+  }
   function openFolder(dir) {
     apiFetch("/download/reveal", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -640,7 +650,7 @@
       .catch(function () { hint("打开文件夹失败：网络错误"); });
   }
   function copyPath(t) {
-    hostRequest("clipboard.writeText", { text: t.filePath || "" }).catch(function () {});
+    try { hana.clipboard.writeText(t.filePath || ""); } catch (e) { /* 复制失败不弹窗 */ }
   }
   function cancelTask(t) {
     apiFetch("/download/cancel?taskId=" + encodeURIComponent(t.taskId), { method: "POST", cache: "no-store" })

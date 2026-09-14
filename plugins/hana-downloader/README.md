@@ -1,233 +1,208 @@
 # Hana Downloader · 小花下载器（v2 App）
 
-> App ID：`hana-downloader` · 为 HanaAgent 提供**可观测下载**能力：
-> 下载任务实时可视化、进度可查询、中途可干预、终态可靠通知。
-> 支持 URL 下载与命令型下载（git clone / pnpm install），另有跨会话管理器。
+App ID：`hana-downloader` · 当前版本：**1.0.0**（2026-09-13 重构版）
+宿主基线：HanaAgent **0.978.0**（实测；0.970.9 需临时补丁才能出卡，见第七节）
+卡片尺寸：**450 × 32 px**——宽度由卡片上报自定，高度完全跟内容走（见第九节）
 
-- 当前版本：v0.90.2
-- 宿主基线：HanaAgent 0.946.2（实测）
-- 形态：v2 App（单 bundle 入口 + local-machine 受管下载引擎）
-
----
-
-## 一、这是什么
-
-从 v1 插件形态完整迁移到 v2 App 的版本。迁移的动因是 v2 提供了
-`ctx.tasks`（宿主统一任务与投递），可以让"下载完成后通知会话"这件事
-走宿主正门，而不再依赖插件自己维护占位与注入通道。
-
-原有的四项能力一项不少：实时进度卡片、进度查询、取消、跨会话管理器。
+为 HanaAgent 提供**可观测下载**：任意 URL 下载、命令型下载（git clone / pnpm install）、
+聊天流内实时进度卡片、跨会话下载管理器。
 
 ---
 
-## 二、架构
+## 一、能力
 
-```
-┌───────────────────────────────────────────────────────────┐
-│  展示层（ui/，跑在 App iframe 里）                          │
-│  ├─ card.html / card.js     进度卡片（聊天流内嵌）           │
-│  └─ manager.html / manager.js 跨会话管理器                   │
-│      └─ hdboot.js：适配层，把旧请求重写到引擎 API             │
-├───────────────────────────────────────────────────────────┤
-│  App 层（index.js，宿主 AppHost 子进程）                     │
-│  ├─ 注册四个工具（download-file/command/wait/cancel）        │
-│  ├─ 拉起并管理受管下载引擎（ctx.runtime）                     │
-│  ├─ 投递：拿到 callToken → ctx.tasks.create → 完成后 complete │
-│  └─ 路由：/engine/* 转发前端请求到引擎                        │
-├───────────────────────────────────────────────────────────┤
-│  引擎层（engine/，local-machine 受管程序）                    │
-│  ├─ server.js   HTTP 服务（127.0.0.1:4317）                  │
-│  ├─ dlcore.js   任务管理器（流式下载/测速/限速/停滞/持久化）    │
-│  └─ progress-parsers.js  git / pnpm 输出解析                 │
-└───────────────────────────────────────────────────────────┘
-```
-
-**为什么要一个独立的受管引擎**：v2 App 的子进程受 Node Permission Model 约束，
-不能裸 `fetch`、也不能任意落盘。只有 `profile: "local-machine"` 的受管程序
-才能保住"任意 URL + 任意落盘目录"这两个原有能力。
-
-**App 与引擎怎么通信**：App 侧经 `ctx.network.fetch` 访问 `127.0.0.1:4317`。
-不用 `ctx.runtime.start({ service })` 的回环服务代理——那条路会留一条常驻 RPC，
-卡死工具回包（详见 `docs/踩坑记录.md` 第 4 条）。
-
----
-
-## 三、安装
-
-```bash
-# 开发期：把整个目录放进宿主 apps/
-cp -r hana-downloader-app  ~/.hanako/apps/hana-downloader
-
-# 重载
-curl -X POST http://127.0.0.1:14500/api/extensions/app:hana-downloader/reload \
-  -H "Authorization: Bearer <token>"      # token 见 ~/.hanako/server-info.json
-```
-
-需要在宿主「设置 → 应用」里逐项授权以下能力：
-
-| capability | 用途 |
+| 工具 | 用途 |
 | --- | --- |
-| `app/runtime.execute` | 拉起受管引擎 |
-| `app/runtime.local-machine` | 让引擎以本机权限运行（任意 URL / 任意落盘） |
-| `app/runtime.network` | 受管引擎出网 |
-| `app/tasks.manage` | 建/结算宿主任务，完成结果投递给会话 |
-| `app/session.start-turn` | 会话投递 |
-| `app/tools.expose-to-model` | 把工具暴露给模型 |
+| `download-file` | 下载任意 http/https 文件到指定或默认目录，返回 taskId |
+| `download-wait` | 查一个任务的进度快照（state / 进度 / 速度），立即返回不阻塞 |
+| `download-cancel` | 取消进行中的任务，半成品保留供续传 |
+| `download-command` | `git-clone` 克隆仓库 / `pnpm-install` 安装依赖，仅这两种 |
 
-另需清单顶层 `network`（`allowedHosts: ["127.0.0.1"]` + `allowLocalhost: true`），
-供 App 侧 `ctx.network.fetch` 访问本机引擎。
+配套：
 
----
-
-## 四、工具
-
-| 工具 | 用途 | 关键参数 |
-| --- | --- | --- |
-| `download-file` | URL 下载，发起即返回 taskId | `url`（必填）、`saveDir`、`fileName` |
-| `download-command` | 命令型下载 | `kind`（`git-clone` / `pnpm-install`）、`repo`、`targetDir`、`workdir`、`label` |
-| `download-wait` | 查进度快照（立即返回、不阻塞） | `taskId` |
-| `download-cancel` | 取消下载 | `taskId` |
-
-工具返回值统一为 `{ content: [{ type: "text", text }], details }`；
-`details.card` 触发聊天流内嵌卡片，`details.download` 带结构化快照。
-
-下载完成后由宿主经 `ctx.tasks` 把结果投递回发起会话，模型无需轮询。
-
-### 命令型的两条边界
-
-- 只认 `git-clone` 与 `pnpm-install` 两种，不接受任意命令。
-- 不做 shell 拼接，全部数组传参；Windows 下 pnpm 的 `.cmd` shim 会被解析到真实
-  JS 入口，用当前 node 执行，避开 `shell:false` 的 EINVAL。
+- **聊天流进度卡**：每次发起下载，会话里挂一张实时进度卡。**两行布局**：
+  信息行（状态徽标 · 速度/剩余/阶段 · 失败原因）+ 进度条行（进度条 · 百分比 · 已完成/总量）。
+  完成态给「打开 / 文件夹」，可折叠、可一键全展（多张卡联动）。
+- **下载管理器**：跨会话统一看所有任务、清理已完成、取消在途。
 
 ---
 
-## 五、引擎 HTTP API
+## 二、安装
 
-引擎监听 `127.0.0.1:4317`，路径避开了 `/download/*` 前缀（宿主保留段）。
-
-```
-GET  /ping                                健康检查
-POST /download    { url, fileName?, saveDir?, speedLimit?, stallTimeoutMs?, sessionPath? }
-POST /command     { kind, repo?, targetDir?, workdir?, label?, sessionPath? }
-GET  /wait?taskId=xxx                     进度快照
-POST /wait        { taskId }              同上（POST 版，宿主路由对带 query 的路径不友好）
-POST /cancel      { taskId, source? }     取消
-POST /cancel-all                          取消全部
-GET  /list                                全部任务
-POST /clear                               清理终态任务
-POST /reveal      { filePath }            在系统文件管理器中定位
-GET|POST /settings                        读写引擎设置
-GET  /events                              SSE：终态 / 停滞事件流
-```
-
-App 侧的转发入口（给前端用）：
+宿主 → 设置 → 应用 → 安装（来源选本地目录）：
 
 ```
-GET /api/apps/hana-downloader/routes/engine/<path>   → 引擎 /<path>
-GET /api/apps/hana-downloader/routes/engine-base     → {"ok":true,"base":"engine"}
-GET /api/apps/hana-downloader/routes/engine-status   → 受管运行时状态
+D:\HanakoWorks\hana-downloader-app
+```
+
+首次安装需要在确认页批准。清单里声明的能力：
+
+```
+app/runtime.execute           受管运行时
+app/runtime.local-machine     引擎需要本机文件能力
+app/runtime.network           引擎与下载经受控出网
+app/tasks.manage              宿主任务（完成回执）
+app/session.start-turn        往会话投递进度卡
+app/sessions.manage
+app/tools.expose-to-model     把四个工具暴露给模型
+app/resources.read            管理器「选目录」
+app/ui.clipboard-write        卡片「复制路径」
+app/hooks.agent-pre-step      下载铁律注入
+```
+
+**装完或改完代码都要重启宿主**（见「五、开发」）。
+
+---
+
+## 三、使用
+
+对助手说一句就行：下载某个 URL、克隆某个仓库、装某个项目的依赖。
+助手调用对应工具后，会话里会出现进度卡，不需要额外指令。
+
+- 卡片上的「取消」会终止下载并保留半成品；
+- 完成后卡片给「打开 / 文件夹 / 复制路径」；
+- 助手可以用 `download-wait` 中途回查进度，也可以什么都不做等完成通知。
+
+---
+
+## 四、配置
+
+引擎设置存在 `{appDataDir}/engine-config.json`：
+
+| 键 | 含义 |
+| --- | --- |
+| `defaultSaveDir` | 未显式指定保存目录时用的默认目录 |
+| `agentChooses` | `true` 表示由助手每次自行决定，不套用 `defaultSaveDir` |
+| `stallTimeoutMs` | 连接停滞多久算卡滞（默认由内核决定） |
+
+运行数据目录：`C:\Users\John Galt\.hanako\app-data\hana-downloader\`
+
+```
+tasks.json        任务记录（引擎 restore 用）
+finished/         终态快照，App 侧靠读它结算宿主任务（不走 RPC 轮询）
+stalled/          卡滞标记
+bindings.json     卡片绑定表：pending（待认领）/ bind（cardInstanceId → taskId）
+speed-cache.json  测速缓存
 ```
 
 ---
 
-## 六、目录结构
+## 五、开发
+
+**改完代码必须重启宿主**，v2 App 没有热重载通道。
+宿主读的是安装记录里的 `source.path`（也就是本目录），不需要往 `~/.hanako/apps/` 拷贝。
+
+本地目录安装的 app 可以走 `POST /api/extensions/:ref/reload` 原地重载，
+但**重载后工具调用的 RPC 通道会指向已消失的旧 peer**（调用报 `RPC peer closed`），
+路由虽然还活着，工具却不可用。所以 reload 只适合"确认能不能装载"的轻验证，
+验收一律重启宿主。详见 `docs/踩坑记录.md` 第 14 条。
+
+---
+
+## 六、结构
 
 ```
 hana-downloader-app/
-├── manifest.json            v2 清单（capabilities / network / contributes.cards）
-├── index.js                 入口：工具注册、引擎管理、投递、路由
-├── assets/icon.svg
+├── manifest.json       v2 清单：capabilities / network / cards / messageRenderers
+├── index.js            defineApp(async sdk => …)  官方 @hana/app-sdk 入口
+├── sdk/                官方 SDK dist（77 个 .js，随 app 分发，不装 npm 包）
 ├── engine/
-│   ├── server.js            受管引擎 HTTP 服务
-│   ├── dlcore.js            下载内核（从插件时代复用，纯 Node 无宿主依赖）
-│   └── progress-parsers.js  git / pnpm 输出解析
+│   ├── server.js       受管下载引擎：HTTP 面 + 卡片绑定表
+│   ├── dlcore.js       下载内核（HTTP 下载 / 断点续传 / git / pnpm 进度解析）
+│   └── progress-parsers.js
 ├── ui/
-│   ├── card.html / card.js / card.css        进度卡片
-│   ├── manager.html / manager.js / manager.css  跨会话管理器
-│   └── hdboot.js            适配层（旧请求 → 引擎 API）
+│   ├── card.html / card.js        聊天流进度卡
+│   ├── manager.html / manager.js  跨会话管理器
+│   ├── card.css / manager.css     视觉素材
+│   ├── assets/sdk.js              官方 UI SDK（dist/ui.js）
+│   └── face.png                   卡片内联图标位图
+├── assets/icon.png | icon.svg
 └── docs/
-    ├── 踩坑记录.md                   迁移过程中踩到的坑与解法（含 3 条宿主通用结论）
-    ├── 七象限测试报告-20260910.md    投递能力验收
-    └── hana-app卡片尺寸与身份反馈.md  给宿主开发者：卡片尺寸锁死与卡外按钮无身份
+    ├── 重构说明.md                 本次重构的动因、实测结论、新架构
+    ├── 踩坑记录.md                 16 条，含四条宿主侧通用结论
+    ├── 七象限测试报告-20260914.md  最新：宿主 0.978.0 / 宽度 450，7/7 完成
+    ├── 七象限测试报告-20260910.md  历史：宿主 0.946.2 / 宽度 550
+    ├── 宿主缺陷-v2应用卡片投影丢工具名.md
+    └── hana-app卡片尺寸与身份反馈.md
 ```
 
-引擎数据目录：`{HANA_HOME}/app-data/hana-downloader/`
-（`tasks.json` 任务快照、`finished/*.json` 终态结果、`speed-cache.json` 测速缓存）。
+---
+
+## 七、卡片投递机制（作者备忘）
+
+聊天流卡走**工具返回值 `details.card`**：宿主把它投影成内联 iframe，挂在**工具调用块下方**，
+随工具返回**实时出现**；卡片自己每 600ms 轮询引擎拿进度。不往会话投消息，既实时又无污染。
+
+### 宿主侧前置条件
+
+**0.978.0 及以上：原生可用，无需任何补丁。**
+宿主在 `LV()` 里用新增的 `F$t(t, e)` 把原始工具名 `tool_call` 换成
+`details.bridgedTool.name`（宿主自动填，例如 `download-file`），
+再把修正后的名字交给 `resolveToolOwner`，归属解析因此能命中 v2 App。
+
+**0.970.9：需要一条临时补丁**（仅该版本）。
+那一版修出来的名字只喂内置渲染器表，归属解析仍用原始名，卡片会被静默丢弃。
+补丁文件见 `_tools/hana-host-patches/`（`patch-2026-09-13-003`），**0.978.0 起已退役**。
+
+### 卡片身份
+
+创建任务时由 App 给出稳定实例 id：`sha256(appId:taskId)` 前 20 位，形如 `a_` + 20 位十六进制，
+写进 `details.card.cardInstanceId`。宿主原样采用（实测：重启前后、实时与历史投影四处一致），
+卡片加载后报出它就能直接查到任务，不依赖加载顺序推断。
+
+### 备选通道（补丁也不可用时）
+
+可退回 `session:send-custom` + `contributes.messageRenderers`。代价：流式中的投递只能排成
+`followUp`，卡片要等本回合结束才出现，而且那条消息会进模型上下文。
+清单里的 `messageRenderers` 声明保留着，随时可切回。
+## 八、已知限制
+
+1. **历史遗留卡可能抢新任务**：若池子里只剩一条新任务，而某张没有 pending 记录的旧卡先加载，
+   它会把这条任务认领走。实际影响很小（新卡在视口里，通常先加载先认领），
+   彻底解决需要宿主把消息身份暴露给卡片 iframe。
+2. **reload 后工具 RPC 通道失效**：`POST /api/extensions/:ref/reload` 换的是 App 子进程，
+   路由逐请求解析所以还活着，工具 RPC 是常驻连接就断了（调用报 `RPC peer closed`）。
+   开发期验收仍需重启宿主。**0.978.0 实测仍如此**（见 `docs/踩坑记录.md` 第 14 条）。
+
+> 以下两条为历史限制，**已在宿主 0.978.0 解决**，保留作对照：
+>
+> - ~~并发投递会被合并~~：那是 `session:send-custom` 隧道的 followUp 队列行为。
+>   现在卡片走工具结果通道，不走队列，同一回合并发多张卡各自成块（实测）。
+> - ~~聊天流卡宽度不可控~~：0.978.0 起信封宽度上限提到 774px，页面上报生效
+>   （实测上报 450 → 渲染 449px）。详见 `docs/踩坑记录.md` 第 6、10 条的新增标注。
 
 ---
 
-## 七、界面
+## 九、卡片尺寸怎么定的
 
-两处 UI 决定值得记下。
+两个数字都不写死在宿主里，各自有明确来源：
 
-**聊天流卡片**。卡宽由宿主限定（任务族统一宽度 `--chat-task-block-width: 348px`，
-详见「已知限制」），因此首行只放两个高频操作：
-
-- URL 任务完成态：`打开` + `文件夹`
-- 命令型任务完成态：`打开文件夹`（目录无「打开文件」语义）
-
-`复制路径` 下沉到展开详情里的「操作」行，与「路径」行相邻，想复制时目光本来就在路径上。
-
-**滚动条**。管理器列表的滚动条对齐宿主原生卡片（工作台卡等）：
-宽度 4px、滑块 `rgba(128, 128, 128, 0.2)`、悬停 `.4`、圆角 2px、两端按钮隐藏；
-同时写 `scrollbar-width: thin` 与 `scrollbar-color`，兼顾 Firefox。
-
-**设置菜单**。管理器工具条上的文件夹按钮里有三项，写入引擎数据目录的
-`engine-config.json`，下载时作为缺省值生效：
-
-| 项 | 作用 |
-| --- | --- |
-| 设置默认下载目录 | 所有未显式指定 `saveDir` 的下载落到这里 |
-| 助手选择下载地址 | 反过来，由 Agent 每次决定；固定目录不套用 |
-| 停滞判定阈值 | 无新数据超过该毫秒数判定为停滞（默认 30000） |
-
-## 八、状态机
-
-任务状态：`pending` → `running` → `done` / `failed` / `canceled` / `interrupted`
-
-- URL 任务取消后保留 `.part` 半成品供断点续传；
-- `git-clone` 任务失败/取消时清理半成品目录（避免留下不完整仓库）；
-- `pnpm-install` 保留 `node_modules` 半成品。
-
----
-
-## 九、已知限制
-
-- 命令型仅支持 `git-clone` / `pnpm-install`，不做通用命令执行。
-- 引擎监听固定端口 4317；多个实例同时运行会冲突（重载时会先停掉本 App 的遗留实例）。
-- 进度卡片依赖前端轮询引擎，慢网络下刷新有延迟。
-- **聊天流内嵌卡片的宽度上限由宿主卡壳决定**（宽度 = 卡壳 `clientWidth`，随窗口浮动，
-  小窗口实测 347px、大窗口 937px）；`hana.ui.resize({ width })` 没有接收方，
-  页面只能"窄于上限"不能"宽于上限"。卡片布局按窄宽设计：首行只放徽章与操作按钮，
-  进度与元信息分行；`html` / `body` / 根容器显式 `width:100%` 以免自行收缩。
-  参见 `docs/hana-app卡片尺寸与身份反馈.md` 与 `docs/踩坑记录.md` 第 6 条。
-- 中途停滞（`stalled`）状态无法主动投递给模型：v2 任务模型是「一次 execute → 一条终态
-  通知」，`ctx.tasks.create` 需要当前有效的 `callToken`，而 `callToken` 只在 execute 期间
-  有效。目前改为引擎落盘 `stalled/*.json` 供前端展示，不惊动模型。
-
----
-
-## 十、v1 遗留清理（2026-09-11）
-
-从 v1 插件整机迁到 v2 App 之后，宿主里还挂着一批过渡期的东西，已一并清掉。
-
-**卸载的 app**
-
-| app | 作用 | 处置 |
+| 维度 | 值 | 来源 |
 | --- | --- | --- |
-| `hd-sync-bridge` | 过渡期的“回执桥”：v1 插件把下载回执写成队列文件，这个 app 在 `agent/pre-step` 把队列拼进消息 | 移除 |
-| `rt-probe` | 验证 local-machine 运行时与 `ctx.tasks` 能力的探针 | 移除 |
-| `_disabled-sync-probe-*` | 更早的探针残骸 | 移除 |
+| 宽度 | 450px（实测渲染 449px） | 页面用 `hana.ui.resize({ width })` 上报，宿主按“上报值 − 1px”采纳（0.978.0 起生效） |
+| 高度 | 32px（由内容决定，无固定值） | `measureH()` 量身：信息行 18px + 进度条行 14px；下限 24px 兜底 |
 
-桥为什么曾经需要：v1 插件有“任意 URL / 任意落盘 / spawn”这些宽能力，但没有 hooks 正门；
-app 有 hooks 正门，却受权限沙箱约束。两边各取所长，才有了“插件写队列 + app 注入”的绕行。
-整机迁成 v2 App 后 `ctx.tasks` 直接可用，桥就失去了意义。
+**改宽度**：改 `ui/card.js` 的 `CARD_WIDTH` 与 `index.js` 里两处 `preferredWidthPx`，三处保持一致。
 
-**卡片侧的旧凭据**
+**改高度**：不要动高数值，改 CSS 即可（行高、按钮尺寸、间距都是变量）。注意两点：
 
-`card.js` / `manager.js` 里还留着 v1 时代的 `LOOPBACK_TOKEN`（URL 上的 `token=`）与
-`X-Hana-Plugin-Surface-Session` 头，与 `hdboot.js` 的 v2 票据（`appSurfaceSession` →
-`X-Hana-App-Surface-Session`）重复。v2 下 URL 不带 `token`，那段逻辑恒为空，是死代码。
-现在凭据统一由 hdboot 注入，业务代码不再自管。
+1. `body` 主规则里的 `font-size` 会盖掉文件顶部 `html, body` 那条——同名规则后写者胜，且不报错；
+2. `measureH()` 里那个下限（`if (h < 24) h = 24`）改大就是把卡片钉在地上，别把它当成测量结果。
 
-**验证**：宿主重启后管理器卡连续 `fwd GET /list -> 200`，链路正常。
+实测沿革：45 → 40 → **32px**（去掉三行布局与 40px 上报地板后）。
+
+---
+
+## 十、测试
+
+七象限投递能力测试（完成 / 取消 / 卡滞 × 未收束 / 已收束 + 卡滞恢复），
+最新一轮：宿主 0.978.0、宽度 450、**7/7 完成**，见 `docs/七象限测试报告-20260914.md`。
+
+可复现的测试源（本地 HTTP，用于造完成/慢速/卡滞/恢复四类现场）：
+
+```
+D:\HanakoWorks\_temp\fast-server.mjs              18932  6MB 一次性
+D:\HanakoWorks\_temp\slow-server.mjs              18933  6MB @ 80KB/s
+D:\HanakoWorks\_temp\stall-server.mjs             47653  1KB 后静默 150s
+D:\HanakoWorks\_temp\stall-recover-server-v5.mjs  18951  50MB，50% 停 35s，等 POST /trigger-resume
+```
