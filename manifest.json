@@ -1,0 +1,65 @@
+{
+  "manifestVersion": 2,
+  "id": "hana-downloader",
+  "name": "Hana Downloader",
+  "version": "1.0.0",
+  "description": "小花下载器（v2 App）：任意 URL 下载、命令型下载（git clone / pnpm install）与跨会话下载管理器。聊天流卡片经官方 messageRenderers 通道投递。",
+  "entry": "index.js",
+  "icon": "assets/icon.png",
+  "minAppVersion": "0.978.0",
+  "network": {
+    "allowedHosts": [
+      "127.0.0.1"
+    ],
+    "methods": [
+      "GET",
+      "POST"
+    ],
+    "allowLocalhost": true,
+    "defaultTimeoutMs": 30000,
+    "maxResponseBytes": 5242880
+  },
+  "capabilities": [
+    "app/runtime.execute",
+    "app/runtime.local-machine",
+    "app/runtime.network",
+    "app/tasks.manage",
+    "app/session.start-turn",
+    "app/sessions.manage",
+    "app/tools.expose-to-model",
+    "app/resources.read",
+    "app/ui.clipboard-write",
+    "app/hooks.agent-pre-step"
+  ],
+  "contributes": {
+    "cards": [
+      {
+        "id": "manager",
+        "title": "下载管理器",
+        "description": "跨会话统一管理所有下载任务",
+        "route": "/manager.html",
+        "cardForm": "flush",
+        "realization": "page",
+        "face": {
+          "image": "face.png"
+        }
+      },
+      {
+        "id": "progress",
+        "title": "下载进度",
+        "description": "单个下载任务的实时进度卡片",
+        "route": "/card.html",
+        "cardForm": "flush",
+        "face": {
+          "image": "face.png"
+        }
+      }
+    ],
+    "messageRenderers": [
+      {
+        "customType": "download",
+        "cardId": "progress"
+      }
+    ]
+  }
+}

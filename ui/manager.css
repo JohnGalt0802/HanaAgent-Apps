@@ -1,0 +1,451 @@
+/* manager.css — Hana 下载管理器（跨会话）样式
+   主题跟随重建版：页面自包含两套色板（浅/深），只按 data-hana-theme 的明暗二态切换。
+   不依赖宿主 CSS 变量注入，颜色全部由本页面定义，可穷尽验证。 */
+
+/* ── 浅色板（默认）── 自包含暖纸色（实测宿主不注入 iframe CSS 变量，不能 var(--color-*)） */
+:root {
+  --mgr-text: #3B3D3F;
+  --mgr-muted: #8E9196;
+  --mgr-border: rgba(122, 96, 88, 0.18);
+  --mgr-border-soft: rgba(122, 96, 88, 0.1);
+  --mgr-accent: #537D96;
+  --mgr-hover: rgba(83, 125, 150, 0.08);
+  --mgr-row-bg: rgba(83, 125, 150, 0.04);
+  --mgr-input-bg: rgba(0, 0, 0, 0.05);
+  --mgr-bg: #FCFAF5;
+  --mgr-success: #7BAE7F;
+  --mgr-danger: #8B3A3A;
+  --mgr-warn: #B45309;
+}
+
+/* ── 深色板（body.t-dark）── 自包含青夜色 */
+body.t-dark {
+  --mgr-text: #E1EAF0;
+  --mgr-muted: #A3B5C0;
+  --mgr-border: rgba(170, 121, 141, 0.16);
+  --mgr-border-soft: rgba(170, 121, 141, 0.1);
+  --mgr-accent: #F0A6C4;
+  --mgr-hover: rgba(201, 154, 175, 0.11);
+  --mgr-row-bg: rgba(201, 154, 175, 0.06);
+  --mgr-input-bg: rgba(255, 255, 255, 0.08);
+  --mgr-bg: #445560;
+  --mgr-success: #8CC790;
+  --mgr-danger: #C77070;
+  --mgr-warn: #F0C060;
+}
+
+html, body {
+  margin: 0 !important;
+  padding: 0;
+  overflow: hidden; /* 外层不滚动，内容由 .mgr-list 内部滚动 */
+}
+
+#dl-root {
+  font-family: "Noto Serif SC", "Songti SC", "Source Han Serif SC", SimSun, Georgia, serif; /* 衬线字体（管理器页全局，用户要求仅统计行改字体，其余保留衬线） */
+  color: var(--mgr-text, #101012);
+  font-size: 13px;
+  line-height: 1.45;
+  min-height: 60px;
+  box-sizing: border-box;
+  /* 高度链：内容自适应，但不超过 iframe 视口；工具栏占位，列表在剩余空间内滚动。
+     不用 height:100%（宿主高度若跟随报高会循环），也不用固定 max-height（宿主上限一变就裁死）。 */
+  display: flex;
+  flex-direction: column;
+  /* 视口约束：内容自适应但不超过 iframe 可视高，列表在剩余空间内滚动。
+     不用固定 max-height（宿主视口一变就裁死），也不用 height:100%（宿主高度若跟随报高会循环）。 */
+  max-height: 100vh;
+  /* 背景：**透明**，底色交给宿主卡片容器（2026-09-14）。
+     原先这里自己铺 var(--bg-card, …) 兜底 #FCFAF5，结果叠在宿主容器上反而显得“带一层底色”，
+     因为宿主主题 CSS 并不注入 iframe，--bg-card 取不到，实际落到的 #FCFAF5 与容器色并非同一层。
+     参照 llama-monitor（同样是宿主卡片里的 App）：body 透明，只给内部区块用变量。 */
+  background: transparent;
+}
+
+/* 滚动条：对齐宿主原生卡片（工作台卡等）
+   宿主 renderer 全局 `*` 规则为：宽度 4px、滑块 rgba(128,128,128,.2)、
+   悬停 .4、圆角 2px、两端按钮隐藏。这里逐项跟齐，避免管理器看起来“不像原生”。
+   （2026-09-10 用户要求） */
+#dl-root {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(128, 128, 128, 0.2) transparent;
+}
+#dl-root ::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+#dl-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+#dl-root ::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.2);
+  border-radius: 2px;
+}
+#dl-root ::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.4);
+}
+#dl-root ::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* 工具栏：设置 + 搜索 + 计数，紧凑一行 */
+.mgr-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  row-gap: 4px; /* 窄面板下计数器整体换行，不再被挤出可视区 */
+  flex-wrap: wrap;
+  flex: 0 0 auto; /* 不参与收缩，高度由内容决定 */
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.1));
+  position: relative;
+}
+
+.mgr-settings {
+  position: relative;
+  flex-shrink: 0;
+}
+.mgr-settings-btn {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  color: var(--mgr-text, #3B3D3F);
+  background: transparent;
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.12));
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.mgr-settings-btn:hover { border-color: var(--mgr-accent, #4A6CF7); }
+.mgr-settings-menu {
+  position: absolute;
+  top: 36px;
+  left: 0;
+  z-index: 50;
+  min-width: 260px;
+  background: var(--mgr-bg, #FFFFFF);
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.12));
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  padding: 8px;
+  display: none;
+}
+.mgr-settings.open .mgr-settings-menu { display: block; }
+.mgr-settings-desc {
+  font-size: 11px;
+  color: var(--mgr-muted, #6B6F73);
+  padding: 4px 8px 8px;
+  word-break: break-all;
+  border-bottom: 1px solid var(--mgr-border-soft, rgba(0, 0, 0, 0.06));
+  margin-bottom: 6px;
+}
+.mgr-settings-opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 8px;
+  font-size: 13px;
+  color: var(--mgr-text, #3B3D3F);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mgr-settings-opt:hover { background: var(--mgr-hover, rgba(0, 0, 0, 0.05)); }
+.mgr-settings-opt.active { color: var(--mgr-accent, #4A6CF7); font-weight: 500; }
+
+/* 搜索框：占满剩余宽度 */
+.mgr-search {
+  flex: 1;
+  min-width: 120px;
+}
+.mgr-search-box {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--mgr-input-bg, rgba(0, 0, 0, 0.05));
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 4px 8px;
+  transition: border-color 0.15s ease;
+}
+.mgr-search-box:focus-within { border-color: var(--mgr-accent, #4A6CF7); }
+.mgr-search-icon { color: var(--mgr-muted, #6B6F73); font-size: 14px; line-height: 1; }
+.mgr-search-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 13px;
+  color: var(--mgr-text, #3B3D3F);
+}
+.mgr-search-clear {
+  width: 18px;
+  height: 18px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--mgr-border, rgba(0, 0, 0, 0.15));
+  color: var(--mgr-text, #3B3D3F);
+  border: none;
+  border-radius: 50%;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.mgr-search-clear.show { display: flex; }
+
+.mgr-counts {
+  padding: 0;
+  font-size: 12px;
+  color: var(--mgr-muted, #6B6F73);
+  white-space: nowrap;
+  flex-shrink: 0;
+  /* 统计行（xx 完成 / xx 异常）：无衬线；显式 !important 避免被全局衬线规则盖掉 */
+  font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Helvetica Neue", Arial, sans-serif !important;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.cnt-running { color: var(--mgr-accent, #4A6CF7); }
+.cnt-done { color: var(--mgr-success, #2E9E5B); }
+.cnt-failed { color: var(--mgr-danger, #D64545); }
+
+.mgr-filters {
+  display: flex;
+  gap: 6px;
+  padding: 6px 12px;
+  flex-wrap: wrap;
+}
+.mgr-filter {
+  background: transparent;
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.12));
+  border-radius: var(--radius-chat-card, 8px);
+  padding: 3px 12px;
+  font-size: 12px;
+  color: var(--mgr-muted, #6B6F73);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.mgr-filter:hover { color: var(--mgr-text, #3B3D3F); border-color: var(--mgr-accent, #4A6CF7); }
+.mgr-filter.active {
+  /* 选中态：accent-light 淡染 + accent 文字 + accent 边（自包含，不依赖宿主变量旧值） */
+  background: var(--mgr-hover, rgba(83, 125, 150, 0.08));
+  border-color: var(--mgr-accent, #537D96);
+  color: var(--mgr-accent, #537D96);
+}
+.mgr-filter-cancelall {
+  color: var(--mgr-danger, #8B3A3A);
+  border-color: var(--mgr-danger, #8B3A3A);
+}
+.mgr-filter-cancelall:hover { color: var(--mgr-danger, #8B3A3A); border-color: var(--mgr-danger, #8B3A3A); background: rgba(139, 58, 58, 0.08); }
+
+.mgr-list {
+  padding: 4px 8px 8px;
+  flex: 1 1 auto;
+  min-height: 0; /* flex 子项可收缩：否则内容撞破容器，overflow-y 永远不触发 */
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 滚到边界不带动外层 */
+}
+.mgr-empty {
+  padding: 20px 12px;
+  text-align: center;
+  color: var(--mgr-muted, #6B6F73);
+  font-size: 13px;
+}
+
+.mgr-row {
+  position: relative; /* 整行进度背景层锚点 */
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.08));
+  border-radius: 8px;
+  margin-bottom: 4px;
+  overflow: hidden;
+  background: var(--mgr-row-bg, rgba(0, 0, 0, 0.015));
+}
+/* 整行进度背景：下载任务行即进度条（左侧蓝 → 右侧绿渐变，随百分比填充 + 流动波动） */
+.mgr-row-bg {
+  position: absolute; inset: 0; width: 0%;
+  background: linear-gradient(90deg, rgba(59, 130, 246, 0.22), rgba(16, 185, 129, 0.18));
+  pointer-events: none;
+  transition: width 0.4s ease;
+  z-index: 0;
+}
+.mgr-row-bg::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 30%, rgba(255, 255, 255, 0.10) 50%, transparent 70%);
+  background-size: 300% 100%;
+  animation: mgr-flow 4s linear infinite;
+}
+@keyframes mgr-flow {
+  0% { background-position: 300% 0; }
+  100% { background-position: -300% 0; }
+}
+.mgr-row-bg.indet {
+  background: linear-gradient(90deg, transparent, rgba(59, 130, 246, 0.30), rgba(16, 185, 129, 0.26), transparent);
+  background-size: 200% 100%;
+  animation: mgr-bg-slide 3.5s linear infinite;
+}
+.mgr-row-bg.indet::after { display: none; }
+@keyframes mgr-bg-slide {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+/* 状态底色：完成淡绿 / 失败淡红（低饱和） */
+.mgr-row.mgr-row-done { background: rgba(74, 180, 120, 0.10); }
+.mgr-row.mgr-row-fail { background: rgba(220, 100, 100, 0.08); }
+/* 内容层提升到进度背景之上 */
+.mgr-head, .mgr-main, .mgr-actions { position: relative; z-index: 1; }
+.mgr-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.mgr-head:hover { background: var(--mgr-hover, rgba(0, 0, 0, 0.03)); }
+
+.mgr-main {
+  flex: 1;
+  min-width: 0;
+}
+.mgr-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.mgr-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.2;
+  color: var(--mgr-muted, #6B6F73);
+}
+/* 状态圆点 + 文字（轻量化：无背景无胶囊，颜色跟随主题变量） */
+.mgr-badge::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+  flex-shrink: 0;
+}
+.st-running { color: var(--mgr-accent, #4A6CF7); }
+.st-pending { color: var(--mgr-warn, #A08030); }
+.st-done { color: var(--mgr-success, #2E9E5B); }
+.st-failed { color: var(--mgr-danger, #D64545); }
+.st-canceled, .st-interrupted, .st-unknown { color: var(--mgr-muted, #6B6F73); }
+
+.mgr-name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mgr-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--mgr-muted, #6B6F73);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mgr-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  position: relative;
+  align-items: center;
+}
+.mgr-btn {
+  background: transparent;
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.15));
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--mgr-muted, #6B6F73);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.mgr-btn:hover { border-color: var(--mgr-accent, #4A6CF7); color: var(--mgr-accent, #4A6CF7); }
+.mgr-btn-danger:hover { border-color: var(--mgr-danger, #D64545); color: var(--mgr-danger, #D64545); }
+.mgr-open-main { padding: 2px 12px; }
+.mgr-more {
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+/* 行内下拉菜单：fixed 定位由 JS 计算（避免被列表 overflow 裁剪/遮挡） */
+.mgr-row-menu {
+  position: fixed;
+  z-index: 999;
+  min-width: 150px;
+  background: var(--mgr-bg, #FFFFFF);
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.12));
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  padding: 4px;
+  display: none;
+}
+.mgr-row-menu-opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--mgr-text, #3B3D3F);
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mgr-row-menu-opt:hover { background: var(--mgr-hover, rgba(0, 0, 0, 0.05)); }
+.mgr-row-menu-opt.mgr-row-menu-danger { color: var(--mgr-danger, #8B3A3A); }
+.mgr-row-menu-opt.mgr-row-menu-danger:hover { background: rgba(139, 58, 58, 0.08); }
+
+.mgr-detail {
+  border-top: 1px solid var(--mgr-border-soft, rgba(0, 0, 0, 0.06));
+  padding: 8px 12px 10px;
+}
+.mgr-detail-row {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+}
+.mgr-detail-k {
+  flex-shrink: 0;
+  width: 64px;
+  color: var(--mgr-muted, #6B6F73);
+}
+.mgr-detail-v {
+  word-break: break-all;
+  min-width: 0;
+}
+
+.mgr-hint {
+  position: fixed;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #333333;
+  color: #FFFFFF;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  z-index: 100;
+}
