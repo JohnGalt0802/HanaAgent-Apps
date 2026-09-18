@@ -724,6 +724,9 @@ class TaskManager {
         }
       } else if (code === 0) {
         task.state = "done";
+        // 完成对齐：进度探测可能在最后一块上落后（外部读到的写盘量滞后于实际），完成即全量。
+        // URL 下载本就相等，无副作用。
+        if (task.total != null && task.received != null && task.received < task.total) task.received = task.total;
         if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
       } else {
         // 非零退出码先交给链路的分类器（winget 的 HRESULT 码表）：
@@ -735,6 +738,7 @@ class TaskManager {
             if (!task.note) task.note = cls.note;
             else if (!task.note.includes(cls.note)) task.note += `；${cls.note}`;
           }
+          if (task.total != null && task.received != null && task.received < task.total) task.received = task.total;
           if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
         } else if (cls && cls.state === "canceled") {
           task.state = "canceled";

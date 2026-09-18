@@ -24,7 +24,10 @@ import http from "node:http";
 import https from "node:https";
 import { createTunnelAgent } from "./tunnel-agent.js";
 
-const POLL_MS = 1500;
+// 采样间隔：winget 的写盘/可见性是 1MB 粒度（大文件约几秒一个跳变），
+// 500ms 能把“跳变的可见延迟”压到半秒内；再快也不会出现更细的数字
+//（跳变单位由 winget 的缓冲决定，不是采样频率）。
+const POLL_MS = 500;
 const HEAD_TIMEOUT_MS = 12000;
 // 速度计算窗口：winget 写盘是 1MB 粒度的（外部读到的 size 按 MB 跳变），
 // 单次 tick 差分在离散跳变下会虚高（实测 695KB/s vs 真实 ~230KB/s），改滑窗差分。

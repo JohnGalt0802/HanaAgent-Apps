@@ -54,9 +54,13 @@ function measureH() {
   return h;
 }
 
+var lastReportedH = 0;
 function reportSize() {
   try {
     const h = measureH();
+    // 高度未变不重复上报（高频轮询下减负；宽度是常量，不参与变化判断）
+    if (h === lastReportedH) return;
+    lastReportedH = h;
     try { hana.ui?.resize?.({ height: h, width: CARD_WIDTH }); } catch { /* 老宿主没有这路 */ }
     try { window.parent.postMessage({ type: "hana.card-resize", height: h }, "*"); } catch { /* 同上 */ }
   } catch { /* 忽略 */ }
@@ -265,7 +269,7 @@ function render(t) {
   const unit = t.unit;
   const sizeText = pending ? "—" : (unit && unit !== "bytes")
     ? (t.received != null ? t.received : 0) + (known ? "/" + t.total : "") + (UNIT_NAME[unit] ? " " + UNIT_NAME[unit] : "")
-    : fmtBytes(t.received) + (known ? "/" + fmtBytes(t.total) : "");
+    : (done && known ? fmtBytes(t.total) : fmtBytes(t.received) + (known ? "/" + fmtBytes(t.total) : ""));
   const speedText = running && t.speed > 0 ? fmtBytes(t.speed) + "/s" : "";
 
   let etaText = "";
@@ -431,5 +435,7 @@ setTimeout(() => {
 (async () => {
   await bindTask();
   await poll();
-  timer = setInterval(poll, 600);
+  // 300ms 一轮（2026-09-18 调快，原 600ms）：数据源 500ms 更新一次，
+  // 再快的收益有限但开销极小（内存快照读取），以跟手为准。
+  timer = setInterval(poll, 300);
 })();
