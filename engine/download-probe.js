@@ -26,6 +26,9 @@ import { createTunnelAgent } from "./tunnel-agent.js";
 
 const POLL_MS = 1500;
 const HEAD_TIMEOUT_MS = 12000;
+// 速度计算窗口：winget 写盘是 1MB 粒度的（外部读到的 size 按 MB 跳变），
+// 单次 tick 差分在离散跳变下会虚高（实测 695KB/s vs 真实 ~230KB/s），改滑窗差分。
+const SPEED_WINDOW_MS = 6000;
 
 // TEMP 候选路径：受管进程的 TEMP 被重定向到 <dataDir>\.runtime-tmp（实测），
 // 普通进程用自己的 TEMP/TMP；两个都试，找到哪个用哪个。
@@ -147,7 +150,7 @@ export function startWingetProbe(task, dataDir, proxyUrl = "") {
   let headTried = false;
   let dirPath = null;
   let lastBytes = 0;
-  let lastAt = 0;
+  const history = []; // [{t, b}] 速度滑窗
 
   const tick = () => {
     if (stopped) return;
@@ -177,16 +180,19 @@ export function startWingetProbe(task, dataDir, proxyUrl = "") {
     const bytes = dirTotalBytes(dirPath);
     const now = Date.now();
     if (bytes > 0) {
-      if (bytes > lastBytes && lastAt > 0) {
-        const inst = Math.round((bytes - lastBytes) / Math.max(0.5, (now - lastAt) / 1000));
-        task.speed = task.speed > 0 ? Math.round(task.speed * 0.5 + inst * 0.5) : inst;
-        task._lastProgressAt = now;
-      }
+      if (bytes > lastBytes) task._lastProgressAt = now; // 有数据流动：喂停滞监视器
       task.received = bytes;
       if (task.unit !== "bytes") task.unit = "bytes";
+      // 速度：滑窗差分（≥1s 的窗口），避开 1MB 写盘粒度的离散跳变造成的虚高
+      history.push({ t: now, b: bytes });
+      while (history.length > 2 && now - history[0].t > SPEED_WINDOW_MS) history.shift();
+      const first = history[0];
+      const dtSec = (now - first.t) / 1000;
+      if (history.length >= 2 && dtSec >= 1 && bytes > first.b) {
+        task.speed = Math.round((bytes - first.b) / dtSec);
+      }
     }
     lastBytes = bytes;
-    lastAt = now;
   };
 
   const stop = () => {
