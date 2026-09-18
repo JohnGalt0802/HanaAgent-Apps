@@ -11,7 +11,9 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { getTaskManager } from "./dlcore.js";
+import { spawn } from "node:child_process";
+import { getTaskManager, resolveWingetBin } from "./dlcore.js";
+import { parseWingetSearch } from "./progress-parsers.js";
 
 const PORT = Number(process.env.HD_ENGINE_PORT || 4317);
 const READY_MARKER = "HD_ENGINE_READY";
@@ -70,6 +72,7 @@ const summarize = (t) => t ? ({
   taskId: t.taskId, state: t.state || t.status, fileName: t.fileName, url: t.url,
   total: t.total ?? null, received: t.received ?? 0, filePath: t.filePath || null,
   error: t.error || null, canceledBy: t.canceledBy || null,
+  cmdType: t.cmd?.type || null, note: t.note || null,
 }) : null;
 
 try { mgr.onFinal((t) => {
@@ -252,7 +255,7 @@ const server = http.createServer(async (req, res) => {
     const b = await readBody();
     const kind = String(b.kind || "").trim();
     const workdir = b.workdir ? path.resolve(String(b.workdir).trim()) : process.cwd();
-    let cmd = null, fileName = "", filePath = "", unit = "bytes";
+    let cmd = null, fileName = "", filePath = "", unit = "bytes", taskUrl = null;
     try {
       if (kind === "git-clone") {
         const repo = String(b.repo || "").trim();
@@ -271,21 +274,66 @@ const server = http.createServer(async (req, res) => {
         fileName = b.label ? String(b.label).trim() : path.basename(workdir) + "（依赖安装）";
         unit = "packages";
         cmd = { type: "pnpm-install", args: [], workdir };
+      } else if (kind === "winget-install") {
+        const pkg = String(b.pkg || "").trim();
+        if (!pkg) return send(400, { error: "winget-install 需要包名或 ID（pkg）" });
+        if (pkg.startsWith("-")) return send(400, { error: "包名不能以 - 开头" });
+        // 先搜后装：search 在本端点同步完成（1~3 秒）；多候选时不创建任务，把候选列表交给工具侧。
+        const cap = await runCapture(resolveWingetBin(),
+          ["search", "--query", pkg, "--accept-source-agreements", "--disable-interactivity"], 30000);
+        if (cap.spawnError) return send(500, { error: `winget 无法启动：${cap.spawnError.message || cap.spawnError}` });
+        const rows = parseWingetSearch(cap.out);
+        if (!rows.length) {
+          return send(200, { ok: false, error: `winget 未找到与「${pkg}」匹配的包（可换关键词或直接给完整 ID）` });
+        }
+        const exact = rows.find((r) => r.id.toLowerCase() === pkg.toLowerCase());
+        const pick = exact || (rows.length === 1 ? rows[0] : null);
+        if (!pick) {
+          return send(200, { ok: false, multiple: true, query: pkg, candidates: rows.slice(0, 10) });
+        }
+        fileName = `${pick.name || pick.id}${pick.version ? " " + pick.version : ""}`;
+        filePath = "";
+        unit = "steps";
+        taskUrl = `winget:${pick.id}`;
+        cmd = {
+          type: "winget-install",
+          pkgId: pick.id,
+          pkgName: pick.name || "",
+          pkgVersion: pick.version || "",
+          scope: b.scope === "user" || b.scope === "machine" ? b.scope : null,
+          source: b.source ? String(b.source).trim() : null,
+        };
+      } else if (kind === "pip-install") {
+        const pkg = String(b.pkg || "").trim();
+        if (!pkg) return send(400, { error: "pip-install 需要包名（pkg）" });
+        if (pkg.startsWith("-")) return send(400, { error: "包名不能以 - 开头" });
+        fileName = b.label ? String(b.label).trim() : pkg;
+        filePath = "";
+        unit = "packages";
+        taskUrl = `pip:${pkg}`;
+        cmd = {
+          type: "pip-install",
+          pkg,
+          runner: b.runner === "uv" ? "uv" : "python",
+          pythonPath: b.pythonPath ? path.resolve(String(b.pythonPath).trim()) : null,
+          upgrade: !!b.upgrade,
+        };
       } else {
-        return send(400, { error: `不支持的命令类型：${kind}（仅支持 git-clone / pnpm-install）` });
+        return send(400, { error: `不支持的命令类型：${kind}（支持 git-clone / pnpm-install / winget-install / pip-install）` });
       }
       const t = await mgr.create({
         kind: "command",
         cmd,
         unit,
         fileName,
-        filePath,
-        saveDir: path.dirname(filePath),
+        filePath: filePath || null,
+        url: taskUrl || undefined,
+        saveDir: filePath ? path.dirname(filePath) : undefined,
         stallTimeoutMs: b.stallTimeoutMs || loadCfg().stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
       });
       log(`created command ${t?.taskId} | ${kind} ${fileName}`);
-      return send(200, { ok: true, taskId: t?.taskId, state: t?.state || t?.status, kind: "command", fileName, filePath });
+      return send(200, { ok: true, taskId: t?.taskId, state: t?.state || t?.status, kind: "command", fileName, filePath: filePath || null });
     } catch (e) {
       log(`command ERR ${e?.message || e}`);
       return send(500, { error: String(e?.message || e) });
@@ -379,6 +427,26 @@ server.listen(PORT, "127.0.0.1", () => {
   // 就绪标记必须独占一行且与 service.readyMarker 精确匹配
   console.log(READY_MARKER);
 });
+
+// ── 通用子进程捕获（同步查询用：winget search）──
+// 收 stdout/stderr 全文；超时杀进程（kill 后 close 会照常回来）。
+function runCapture(bin, args, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(bin, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      resolve({ code: -1, out: "", err: String(e?.message || e), spawnError: e });
+      return;
+    }
+    let out = "", errText = "";
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* 已退出 */ } }, timeoutMs);
+    child.stdout.on("data", (c) => { out += c.toString("utf-8"); });
+    child.stderr.on("data", (c) => { errText += c.toString("utf-8"); });
+    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out, err: String(e?.message || e), spawnError: e }); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, out, err: errText }); });
+  });
+}
 
 // ── 命令型辅助：仓库名提取与安全化 ──
 function repoNameOf(repo) {

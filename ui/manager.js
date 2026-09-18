@@ -58,6 +58,15 @@ import { hana } from "./assets/sdk.js";
     } catch (e6) { /* 诊断失败不影响主流程 */ }
   }, 1200);
 
+  // 阶段文案表（与 card.js 同一套；git/pnpm 系与 winget/pip 系并存）
+  var STAGE_TEXT = {
+    found: "查找包", downloading: "下载中", verifying: "校验哈希", installing: "安装中",
+    collecting: "解析依赖", finalizing: "收尾",
+    receiving: "接收中", checkout: "检出中", fetching: "拉取中", linking: "链接中",
+    building: "编译中", "resolving-deps": "解析依赖", cloning: "准备克隆",
+    enumerating: "枚举对象", resolving: "解析增量",
+  };
+
   var POLL_MS = 3000;
   var tasks = [];
   var filter = "all"; // all | active | done | failed
@@ -233,12 +242,23 @@ import { hana } from "./assets/sdk.js";
 
       var metaRow = el("div", "mgr-meta");
       var metaBits = [];
+      var isPkg = t.cmdType === "winget-install" || t.cmdType === "pip-install";
       if (t.state === "running") {
-        if (t.speed) metaBits.push(fmtSpeed(t.speed));
-        metaBits.push(t.total ? (t.percent != null ? t.percent + "%" : "") : fmtBytes(t.received));
+        if (isPkg) {
+          // 阶段式任务：无速度/字节，显示阶段文案（2026-09-18）
+          metaBits.push(STAGE_TEXT[t.stage] || "安装中");
+        } else {
+          if (t.speed) metaBits.push(fmtSpeed(t.speed));
+          metaBits.push(t.total ? (t.percent != null ? t.percent + "%" : "") : fmtBytes(t.received));
+        }
       } else if (t.state === "done") {
-        metaBits.push(fmtBytes(t.total || t.received));
-        if (t.elapsed) metaBits.push(fmtDuration(t.elapsed));
+        if (isPkg) {
+          if (t.note) metaBits.push(t.note);
+          if (t.elapsed) metaBits.push(fmtDuration(t.elapsed));
+        } else {
+          metaBits.push(fmtBytes(t.total || t.received));
+          if (t.elapsed) metaBits.push(fmtDuration(t.elapsed));
+        }
       } else if (t.error) {
         metaBits.push(t.error);
       }

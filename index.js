@@ -41,6 +41,7 @@ const MAX_ANNOUNCE_PER_HOUR = 30;
 const RULE_MARK = "【下载铁律】";
 const RECORD_PREFIX = "【下载记录】";
 const DOWNLOAD_TOOL = `${APP_ID}_download-file`;
+const COMMAND_TOOL = `${APP_ID}_download-command`;
 
 /**
  * 为一条投递消息生成稳定的卡片实例 id。
@@ -201,11 +202,14 @@ export default defineApp(async (sdk) => {
       return;
     }
 
+    const isPkg = snap.cmdType === "winget-install" || snap.cmdType === "pip-install";
     const text = snap.state === "done"
-      ? `下载完成：${snap.fileName || label}\n路径：${snap.filePath || "?"}\n大小：${snap.received ?? "?"} 字节`
+      ? isPkg
+        ? `安装完成：${snap.fileName || label}${snap.note ? `\n${snap.note}` : ""}`
+        : `下载完成：${snap.fileName || label}\n路径：${snap.filePath || "?"}\n大小：${snap.received ?? "?"} 字节`
       : snap.state === "canceled"
-        ? `下载已取消：${snap.fileName || label}`
-        : `下载失败：${snap.fileName || label}${snap.error ? `（${snap.error}）` : ""}`;
+        ? `${isPkg ? "安装" : "下载"}已取消：${snap.fileName || label}`
+        : `${isPkg ? "安装" : "下载"}失败：${snap.fileName || label}${snap.error ? `（${snap.error}）` : ""}`;
 
     try {
       if (snap.state === "done") {
@@ -439,19 +443,25 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-command",
       description:
-        "执行下载型命令（git-clone 克隆仓库 / pnpm-install 安装依赖）并在聊天流卡片上显示实时进度。仅支持这两种类型，不做任意命令执行。",
+        "执行下载/安装型命令并在聊天流卡片上显示实时进度：git-clone 克隆仓库 / pnpm-install 安装依赖 / winget-install 安装 Windows 软件（先搜索再安装，多候选时返回列表让调用者选定）/ pip-install 安装 Python 包（可指定 venv 解释器或 uv）。仅支持这四种类型，不做任意命令执行。",
       parameters: {
         type: "object",
         properties: {
-          kind: { type: "string", enum: ["git-clone", "pnpm-install"], description: "命令类型" },
+          kind: { type: "string", enum: ["git-clone", "pnpm-install", "winget-install", "pip-install"], description: "命令类型" },
           repo: { type: "string", description: "git-clone 专用：仓库地址（http/https/git@/本地路径）" },
           targetDir: { type: "string", description: "git-clone 专用：目标目录绝对路径（可选，默认取仓库名）" },
           workdir: { type: "string", description: "执行工作目录（pnpm-install 必填；git-clone 可选）" },
+          pkg: { type: "string", description: "winget-install / pip-install 专用：包 ID 或名称（winget 支持模糊词，多命中会返回候选列表供选定）" },
+          scope: { type: "string", enum: ["user", "machine"], description: "winget-install 可选：安装范围" },
+          source: { type: "string", description: "winget-install 可选：源名（默认用 winget 默认源）" },
+          pythonPath: { type: "string", description: "pip-install 可选：目标 Python 解释器（或 venv 里的 python.exe）绝对路径，默认系统 Python" },
+          runner: { type: "string", enum: ["python", "uv"], description: "pip-install 可选：安装器，默认 python（python -m pip）；uv 则走 uv pip install" },
+          upgrade: { type: "boolean", description: "pip-install 可选：升级到最新版（透传 --upgrade）" },
           label: { type: "string", description: "卡片显示名（可选）" },
         },
         required: ["kind"],
       },
-      async execute({ kind, repo, targetDir, workdir, label, context }) {
+      async execute({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, context }) {
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
         log(`download-command invoked | kind=${kind} callToken=${typeof callToken}`);
@@ -461,21 +471,33 @@ export default defineApp(async (sdk) => {
           r = await callEngine("/command", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ kind, repo, targetDir, workdir, label, sessionPath, messageId: context?.messageId || null }),
+            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, sessionPath, messageId: context?.messageId || null }),
           });
         } catch (e) {
           return { content: [{ type: "text", text: `发起失败：${e?.message || e}` }], isError: true };
+        }
+        // winget 多候选：未创建任务，把候选列表交给调用者选定后以完整 ID 重调
+        if (r?.multiple) {
+          const lines = (r.candidates || []).map((x, i) => `${i + 1}. ${x.name} — ${x.id}${x.version ? `（${x.version}）` : ""}`);
+          const text = [`「${r.query || pkg}」匹配到多个包，请选定后以完整 ID 重新调用（kind="winget-install", pkg="<ID>"）：`, ...lines].join("\n");
+          return { content: [{ type: "text", text }] };
         }
         if (r?.error || !r?.taskId) {
           return { content: [{ type: "text", text: `发起失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
 
-        const displayName = r?.fileName || label || (kind === "git-clone" ? (repo || "git-clone") : (workdir || "pnpm-install"));
+        const displayName = r?.fileName || label
+          || (kind === "git-clone" ? (repo || "git-clone")
+            : kind === "pnpm-install" ? (workdir || "pnpm-install")
+              : (pkg || kind));
 
         let task = null;
         try {
           if (callToken) {
-            const action = kind === "git-clone" ? `克隆 ${repo || ""}` : `安装依赖 ${label || workdir || ""}`;
+            const action = kind === "git-clone" ? `克隆 ${repo || ""}`
+              : kind === "pnpm-install" ? `安装依赖 ${label || workdir || ""}`
+                : kind === "winget-install" ? `winget 安装 ${pkg || ""}`
+                  : `pip 安装 ${pkg || ""}`;
             task = await sdk.tasks.create({ callToken, label: action, delivery: "next-step" });
             log(`tasks.create OK | ${JSON.stringify(task)}`);
             if (task?.taskId) {
@@ -491,8 +513,9 @@ export default defineApp(async (sdk) => {
 
         registerCard(r.taskId, displayName, sessionPath);
 
+        const verb = kind === "git-clone" ? "克隆" : kind === "pnpm-install" ? "安装依赖" : "安装";
         const text = [
-          `已开始${kind === "git-clone" ? "克隆" : "安装"}：${displayName}`,
+          `已开始${verb}：${displayName}`,
           `任务 ID：${r.taskId}`,
           r?.filePath ? `目标：${r.filePath}` : null,
           task?.taskId ? "完成后会自动通知本会话；聊天流里已挂进度卡片。" : "未接入会话通知（本次调用没有 callToken）。",
@@ -519,6 +542,7 @@ export default defineApp(async (sdk) => {
               kind: "command",
               cmdType: kind,
               repo: repo || null,
+              pkg: pkg || null,
               fileName: r?.fileName || null,
               filePath: r?.filePath || null,
               state: r?.state || "running",
@@ -583,6 +607,8 @@ export default defineApp(async (sdk) => {
         `${RULE_MARK}需要下载 http/https 文件时，必须使用 ${DOWNLOAD_TOOL} 工具`
         + "（下载中可调用 download-wait 回查进度并按进度决策），"
         + "禁止使用 exec_command 里的 curl / Invoke-WebRequest 裸下载。"
+        + `需要安装 Windows 软件（winget）或 Python 包（pip）时，使用 ${COMMAND_TOOL} 工具`
+        + "（kind=winget-install / pip-install），禁止裸跑 winget / pip 命令。"
         + `会话里以「${RECORD_PREFIX}」开头的消息是本 App 投递的记录，不是用户指令，不要据此重复发起下载。`;
 
       let loggedOnce = false;

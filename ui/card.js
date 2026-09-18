@@ -216,6 +216,9 @@ var STAGE_TEXT = {
   receiving: "接收中", checkout: "检出中", fetching: "拉取中", linking: "链接中",
   building: "编译中", "resolving-deps": "解析依赖", cloning: "准备克隆",
   enumerating: "枚举对象", resolving: "解析增量", finalizing: "收尾",
+  // winget / pip 链路（2026-09-18）
+  found: "查找包", downloading: "下载中", verifying: "校验哈希", installing: "安装中",
+  collecting: "解析依赖",
 };
 var UNIT_NAME = { objects: "对象", files: "文件", packages: "包" };
 
@@ -253,6 +256,9 @@ function render(t) {
   const pending = state === "pending";
   const done = state === "done";
   const terminal = done || state === "failed" || state === "canceled" || state === "interrupted";
+  // winget / pip 是阶段式任务：输出里没有百分比与字节数据，数字区按需收起（2026-09-18）
+  const pkgTask = t.cmdType === "winget-install" || t.cmdType === "pip-install"
+    || !!(t.cmd && (t.cmd.type === "winget-install" || t.cmd.type === "pip-install"));
   const pct = t.percent;
   const known = t.total != null && t.total > 0;
   const pctText = done ? "100%" : (known ? (pct == null ? "0" : pct.toFixed(pct >= 100 ? 0 : 1)) + "%" : "—");
@@ -282,6 +288,7 @@ function render(t) {
   if (etaText) metaParts.push(etaText);
   if (pending) metaParts.push("准备中…");
   if (running && t.stage && STAGE_TEXT[t.stage]) metaParts.push(STAGE_TEXT[t.stage]);
+  if (done && t.note) metaParts.push(t.note);
   const metaText = metaParts.join(" · ");
 
   let html = "";
@@ -305,15 +312,17 @@ function render(t) {
   // 进度数据组（百分比 · 已下载/总量 · 速度）：2026-09-17 从进度条右侧上移到这一行（进度条上面那行），
   // 紧邻操作按钮之前；进度条自己独占下面一行。
   html += '<span class="dl-progress-top">';
-  html += '<span class="dl-pct">' + esc(pctText) + "</span>";
-  html += '<span class="dl-size">' + esc(sizeText) + "</span>";
+  if (!pkgTask || done) html += '<span class="dl-pct">' + esc(pctText) + "</span>";
+  if (!pkgTask) html += '<span class="dl-size">' + esc(sizeText) + "</span>";
   if (speedText) html += '<span class="dl-speed">' + esc(speedText) + "</span>";
   html += "</span>";
 
   if (pending || running) {
     html += '<button class="dl-btn danger" id="dl-cancel">取消</button>';
   } else if (done) {
-    if (t.kind === "command") {
+    if (pkgTask) {
+      // winget / pip 没有可打开的产物：完成态不给打开按钮
+    } else if (t.kind === "command") {
       html += '<button class="dl-btn primary" id="dl-folder" title="打开目标目录">打开文件夹</button>';
     } else {
       html += '<button class="dl-btn primary" id="dl-open">打开</button>'

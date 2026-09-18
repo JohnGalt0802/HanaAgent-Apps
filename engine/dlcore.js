@@ -236,14 +236,16 @@ class TaskManager {
 
     const rawName = (fileName && String(fileName).trim()) || fileNameFromUrl(url);
     const name = sanitizeFileName(rawName);
-    const filePath = explicitPath || uniquePath(path.join(dir, name));
-    const partPath = filePath + ".part";
+    // 落盘路径：命令型任务（winget/pip）没有磁盘产物，显式路径缺省时保持 null，
+    // 不再构造假的“下载目录/名称”路径；URL 与 git/pnpm 的行为不变。
+    const filePath = explicitPath ? explicitPath : (kind === "command" ? null : uniquePath(path.join(dir, name)));
+    const partPath = filePath ? filePath + ".part" : null;
 
     const taskId = randomUUID().slice(0, 8) + "-" + Date.now().toString(36);
     const task = {
       taskId,
       url,
-      fileName: path.basename(filePath),
+      fileName: filePath ? path.basename(filePath) : name,
       filePath,
       saveDir: dir,
       state: state || "running",
@@ -273,6 +275,7 @@ class TaskManager {
       cmd,
       unit,
       stage: null,
+      note: null,
       child: null,
       partPath,
       etag: null,
@@ -602,13 +605,36 @@ class TaskManager {
     }
   }
 
-  // ── 命令型任务：git clone / pnpm install ──
+  // ── 命令型任务（git-clone / pnpm-install / winget-install / pip-install）──
+  // 各链路的差异收在 COMMAND_SPECS 里（build / makeParser / classifyExit），这里只跑框架。
   async _runCommand(task) {
-    const { parseGitLine, createPnpmParser } = await import("./progress-parsers.js");
-    const parser = task.cmd.type === "git-clone" ? parseGitLine : createPnpmParser();
-    // Windows 下 npm 全局装的 pnpm 是 .cmd shim，裸 spawn(pnpm) shell:false 无法执行（EINVAL）；
-    // 解析真实 JS 入口用 node 运行（数组传参，无 shell，无注入面）；git 是真实 exe 原样 spawn
-    const resolved = resolveCommandBin(task.cmd);
+    const pp = await import("./progress-parsers.js");
+    const spec = COMMAND_SPECS[task?.cmd?.type] || null;
+    if (!spec) {
+      task.state = "failed";
+      task.error = `未知的命令类型：${task?.cmd?.type || "?"}`;
+      task.finishedAt = Date.now();
+      task.elapsed = task.finishedAt - (task.startedAt || task.finishedAt);
+      this._persist();
+      this._fireFinal(task);
+      return;
+    }
+    const parser = spec.makeParser(pp, task.cmd);
+    const classifyExit = spec.classifyExit ? spec.classifyExit(pp) : null;
+
+    // 二进制与参数由链路自己的 build 构造；构造失败（如解释器不存在）按启动失败收口
+    let resolved;
+    try {
+      resolved = spec.build(task.cmd);
+    } catch (err) {
+      task.state = "failed";
+      task.error = "命令无法启动：" + (err?.message || String(err));
+      task.finishedAt = Date.now();
+      task.elapsed = task.finishedAt - (task.startedAt || task.finishedAt);
+      this._persist();
+      this._fireFinal(task);
+      return;
+    }
     const cmdBin = resolved.bin;
     const fullArgs = resolved.args;
 
@@ -645,6 +671,18 @@ class TaskManager {
         if (!line) continue;
         const r = parser(line);
         if (!r) continue;
+        // 派生信息（pkgName / currentFile / upgrading 等）浅合并进任务；核心字段受保护
+        if (r.meta && typeof r.meta === "object") {
+          for (const [k, v] of Object.entries(r.meta)) {
+            if (v == null || META_PROTECTED.has(k)) continue;
+            task[k] = v;
+          }
+        }
+        // 备注（如“PATH 已更新，重启 shell 后生效”）：去重累积，供卡片与结算文案使用
+        if (r.note) {
+          if (!task.note) task.note = r.note;
+          else if (!task.note.includes(r.note)) task.note += `；${r.note}`;
+        }
         if (r.pct != null) {
           task.stage = r.stage;
           if (r.unit) task.unit = r.unit;
@@ -678,9 +716,41 @@ class TaskManager {
         task.state = "done";
         if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
       } else {
-        task.state = "failed";
-        const tail = task._cmdBuf ? task._cmdBuf.slice(-4000) : "";
-        task.error = (task._spawnError ? task._spawnError.message + "；" : "") + `命令退出码 ${code}` + (tail ? `：${tail.split(/\n/).slice(-3).join("\n")}` : "");
+        // 非零退出码先交给链路的分类器（winget 的 HRESULT 码表）：
+        // 分类器可把特定非零码判为 done（如“已安装、无可用更新”）或 canceled。
+        const cls = typeof classifyExit === "function" ? classifyExit(code) : null;
+        if (cls && cls.state === "done") {
+          task.state = "done";
+          if (cls.note) {
+            if (!task.note) task.note = cls.note;
+            else if (!task.note.includes(cls.note)) task.note += `；${cls.note}`;
+          }
+          if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
+        } else if (cls && cls.state === "canceled") {
+          task.state = "canceled";
+          task.error = cls.error || "已取消";
+        } else {
+          task.state = "failed";
+          const tail = task._cmdBuf ? task._cmdBuf.slice(-4000) : "";
+          // HRESULT 风格的大码（winget）附十六进制，方便对照码表排查
+          const codeU = Number(code) >>> 0;
+          const hexSuffix = codeU >= 0x80000000 ? `（0x${codeU.toString(16).toUpperCase()}）` : "";
+          const clsMsg = cls && cls.error ? cls.error + "；" : "";
+          task.error = (task._spawnError ? task._spawnError.message + "；" : "") + clsMsg
+            + `命令退出码 ${code}` + hexSuffix + (tail ? `：${tail.split(/\n/).slice(-3).join("\n")}` : "");
+        }
+      }
+      // 完成备注：把“已安装 <包>”放在最前（winget 成功路径的输出没有成句结果行；
+      // pip/uv 的结果行自带 note，已安装等场景 cls.note 已填）
+      if (task.state === "done") {
+        const c = task.cmd || {};
+        const nm = task.pkgName || c.pkgName;
+        if (nm && (c.type === "winget-install" || c.type === "pip-install")) {
+          const vr = task.pkgVersion || c.pkgVersion;
+          const head = `已安装 ${nm}${vr ? ` ${vr}` : ""}`;
+          if (!task.note) task.note = head;
+          else if (!task.note.includes(head)) task.note = `${head}；${task.note}`;
+        }
       }
       task.finishedAt = Date.now();
       task.elapsed = task.finishedAt - (task.startedAt || task.finishedAt);
@@ -747,8 +817,10 @@ class TaskManager {
       error: t.error,
       kind: t.kind || "url",
       cmd: t.cmd || null,
+      cmdType: t.cmd?.type || null,
       unit: t.unit || "bytes",
       stage: t.stage || null,
+      note: t.note || null,
       sessionId: t.sessionId || null,
       sessionPath: t.sessionPath || null,
       consumedByWait: t.consumedByWait === true,
@@ -843,7 +915,7 @@ class TaskManager {
             if (fs.existsSync(dir)) { fs.rmSync(dir, { recursive: true, force: true }); fileDeleted = true; }
           } catch (e) { fileError = String(e?.message || e); }
         } else {
-          fileSkipped = "该任务为依赖安装，只删除记录，不删除工作目录";
+          fileSkipped = "该任务没有可删除的磁盘产物（命令型任务只删除记录）";
         }
       } else {
         const targets = [t.filePath, t.partPath || (t.filePath ? t.filePath + ".part" : null)].filter(Boolean);
@@ -911,7 +983,7 @@ class TaskManager {
           consumedByWait: m.consumedByWait === true, deferredRegistered: m.deferredRegistered === true,
           delivered: m.delivered === true,
           stalledAt: m.stalledAt || null, stallNotified: false, _lastProgressAt: now,
-          kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null,
+          kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null, note: m.note || null,
           partPath: partPath || "",
           etag: m.etag || null,
           lastModified: m.lastModified || null,
@@ -935,7 +1007,7 @@ class TaskManager {
             consumedByWait: m.consumedByWait === true, deferredRegistered: m.deferredRegistered === true,
             delivered: m.delivered === true,
             stalledAt: m.stalledAt || null, stallNotified: false, _lastProgressAt: now,
-            kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null,
+            kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null, note: m.note || null,
             partPath: m.partPath || (m.filePath ? m.filePath + ".part" : null),
             etag: m.etag || null,
             lastModified: m.lastModified || null,
@@ -975,6 +1047,7 @@ class TaskManager {
           kind: t.kind || "url",
           cmd: t.cmd || null,
           unit: t.unit || "bytes",
+          note: t.note || null,
           stalledAt: t.stalledAt || null,
           sessionId: t.sessionId || null,
           sessionPath: t.sessionPath || null,
@@ -1008,17 +1081,135 @@ function appendBuf(buf, text) {
   return next.slice(-4096);
 }
 
-// 命令可执行入口解析（Windows 兼容）：
-// - git-clone：git 是真实 exe，直接 spawn，数组传参
-// - pnpm-install：npm 全局装的 pnpm 是 .cmd shim，shell:false 的 spawn 执行不了（EINVAL）；
-//   解析到真实 JS 入口（pnpm/bin/pnpm.mjs|cjs）用当前 node 运行，保持无 shell、无注入面
-function resolveCommandBin(cmd) {
-  const args = cmd.args || [];
-  if (cmd.type === "git-clone") return { bin: "git", args: ["clone", "--progress", ...args] };
-  // pnpm-install（及未知类型退化到 pnpm）
-  const entry = findPnpmEntry();
-  if (entry) return { bin: process.execPath, args: [entry, "install", ...args] };
-  return { bin: "pnpm", args: ["install", ...args] }; // 退化：PATH 上有 pnpm.exe 时可用
+// ── 命令链路规格表（winget/pip 链路 2026-09-18 新增）──
+// 每条链路独立配置三点：build（二进制与参数构造，可抛错）、makeParser（输出解析器工厂）、
+// classifyExit（非零退出码的终态判定，可选）。执行框架（spawn / 进度喂入 / 停滞监视 /
+// 取消 / 终态 / 卡片 / 结算）在 _runCommand 中共用，链路之间不互相复制代码。
+const COMMAND_SPECS = {
+  "git-clone": {
+    // git 是真实 exe，直接 spawn，数组传参
+    build: (cmd) => ({ bin: "git", args: ["clone", "--progress", ...(cmd.args || [])] }),
+    makeParser: (pp) => pp.parseGitLine,
+    classifyExit: null,
+  },
+  "pnpm-install": {
+    // npm 全局装的 pnpm 是 .cmd shim，shell:false 的 spawn 执行不了（EINVAL）；
+    // 解析真实 JS 入口（pnpm/bin/pnpm.mjs|cjs）用当前 node 运行，保持无 shell、无注入面
+    build: () => {
+      const entry = findPnpmEntry();
+      if (entry) return { bin: process.execPath, args: [entry, "install"] };
+      return { bin: "pnpm", args: ["install"] }; // 退化：PATH 上有 pnpm.exe 时可用
+    },
+    makeParser: (pp) => pp.createPnpmParser(),
+    classifyExit: null,
+  },
+  "winget-install": {
+    build: (cmd) => ({ bin: resolveWingetBin(), args: buildWingetArgs(cmd) }),
+    makeParser: (pp) => pp.createWingetParser(),
+    classifyExit: (pp) => pp.classifyWingetExit,
+  },
+  "pip-install": {
+    build: (cmd) => buildPipCommand(cmd),
+    makeParser: (pp, cmd) => (cmd.runner === "uv" ? pp.createUvParser() : pp.createPipParser()),
+    classifyExit: null,
+  },
+};
+
+// 解析器 meta 浅合并时的保护键：输出行不允许覆盖任务核心字段
+const META_PROTECTED = new Set([
+  "taskId", "url", "fileName", "filePath", "saveDir", "state", "controller", "child",
+  "pendingTimer", "sessionId", "sessionPath", "kind", "cmd", "cancelRequested", "partPath",
+]);
+
+// winget 可执行解析：where 优先，其次 WindowsApps 别名兜底（受管进程 PATH 不含用户别名时）。
+export function resolveWingetBin() {
+  try {
+    const r = spawnSync("where.exe", ["winget"], { encoding: "utf-8", windowsHide: true });
+    if (r.status === 0) {
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const p = line.trim();
+        if (p && /winget\.exe$/i.test(p) && fs.existsSync(p)) return p;
+      }
+    }
+  } catch { /* 走兜底 */ }
+  const guess = path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "winget.exe");
+  if (fs.existsSync(guess)) return guess;
+  return "winget"; // 退化：依赖 PATH
+}
+
+// winget install 参数（数组传参，无 shell）。--disable-interactivity 禁用交互提示，
+// --accept-* 免首次协议阻塞；-e 精确 ID（ID 由 /command 的 search 阶段确定后传入）。
+function buildWingetArgs(cmd) {
+  const args = [
+    "install", "--id", String(cmd.pkgId || cmd.pkg || ""), "-e",
+    "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity",
+  ];
+  if (cmd.scope === "user" || cmd.scope === "machine") args.push("--scope", cmd.scope);
+  if (cmd.source) args.push("--source", String(cmd.source));
+  return args;
+}
+
+// Python 解释器解析：显式 pythonPath 优先（不存在则抛），否则 where python 第一个。
+function resolvePythonBin(pythonPath) {
+  if (pythonPath) {
+    const p = path.resolve(String(pythonPath));
+    if (!fs.existsSync(p)) throw new Error(`指定的 Python 解释器不存在：${p}`);
+    return p;
+  }
+  try {
+    const r = spawnSync("where.exe", ["python"], { encoding: "utf-8", windowsHide: true });
+    if (r.status === 0) {
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const p = line.trim();
+        if (p && /python[\d.]*(\.exe)?$/i.test(p) && fs.existsSync(p)) return p;
+      }
+    }
+  } catch { /* 走退化 */ }
+  return "python"; // 退化：依赖 PATH
+}
+
+// uv 可执行解析：where 优先，其次 ~/.local/bin/uv.exe（官方安装器默认位置）。
+function resolveUvBin() {
+  try {
+    const r = spawnSync("where.exe", ["uv"], { encoding: "utf-8", windowsHide: true });
+    if (r.status === 0) {
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const p = line.trim();
+        if (p && /uv(\.exe)?$/i.test(p) && fs.existsSync(p)) return p;
+      }
+    }
+  } catch { /* 走兜底 */ }
+  const guess = path.join(process.env.USERPROFILE || "", ".local", "bin", "uv.exe");
+  if (fs.existsSync(guess)) return guess;
+  return "uv"; // 退化：依赖 PATH
+}
+
+// pip 安装命令构造（数组传参，无 shell）：
+//   python 路线：<python> -m pip install --no-input [--upgrade] <pkg>
+//   uv 路线：    uv pip install --python <解释器> | --system [--upgrade] <pkg>
+// pkg 以 - 开头会被目标程序当选项，提前拒绝（server 入口亦有一道校验）。
+function buildPipCommand(cmd) {
+  const pkg = String(cmd.pkg || "").trim();
+  if (!pkg) throw new Error("缺少包名（pkg）");
+  if (pkg.startsWith("-")) throw new Error(`包名不合法：${pkg}`);
+  if (cmd.runner === "uv") {
+    const args = ["pip", "install"];
+    if (cmd.pythonPath) {
+      const py = path.resolve(String(cmd.pythonPath));
+      if (!fs.existsSync(py)) throw new Error(`指定的 Python 解释器不存在：${py}`);
+      args.push("--python", py);
+    } else {
+      args.push("--system");
+    }
+    if (cmd.upgrade) args.push("--upgrade");
+    args.push(pkg);
+    return { bin: resolveUvBin(), args };
+  }
+  const py = resolvePythonBin(cmd.pythonPath);
+  const args = ["-m", "pip", "install", "--no-input"];
+  if (cmd.upgrade) args.push("--upgrade");
+  args.push(pkg);
+  return { bin: py, args };
 }
 
 function findPnpmEntry() {

@@ -4,8 +4,8 @@ App ID：`hana-downloader` · 当前版本：**1.0.0**（2026-09-13 重构版）
 宿主基线：HanaAgent **0.978.0**（实测；0.970.9 需临时补丁才能出卡，见第七节）
 卡片尺寸：**450 × 32 px**——宽度由卡片上报自定，高度完全跟内容走（见第九节）
 
-为 HanaAgent 提供**可观测下载**：任意 URL 下载、命令型下载（git clone / pnpm install）、
-聊天流内实时进度卡片、跨会话下载管理器。
+为 HanaAgent 提供**可观测下载**：任意 URL 下载、命令型安装（git clone / pnpm install /
+winget / pip）、聊天流内实时进度卡片、跨会话下载管理器。
 
 ---
 
@@ -16,7 +16,7 @@ App ID：`hana-downloader` · 当前版本：**1.0.0**（2026-09-13 重构版）
 | `download-file` | 下载任意 http/https 文件到指定或默认目录，返回 taskId |
 | `download-wait` | 查一个任务的进度快照（state / 进度 / 速度），立即返回不阻塞 |
 | `download-cancel` | 取消进行中的任务，半成品保留供续传 |
-| `download-command` | `git-clone` 克隆仓库 / `pnpm-install` 安装依赖，仅这两种 |
+| `download-command` | 四种命令：`git-clone` 克隆仓库 / `pnpm-install` 安装依赖 / `winget-install` 装 Windows 软件 / `pip-install` 装 Python 包（支持 venv 解释器与 uv runner） |
 
 配套：
 
@@ -58,8 +58,13 @@ app/hooks.agent-pre-step      下载铁律注入
 
 ## 三、使用
 
-对助手说一句就行：下载某个 URL、克隆某个仓库、装某个项目的依赖。
+对助手说一句就行：下载某个 URL、克隆某个仓库、装某个项目的依赖、
+装个 Windows 软件（winget）、给某个环境装 Python 包（pip）。
 助手调用对应工具后，会话里会出现进度卡，不需要额外指令。
+
+winget / pip 是**阶段式进度**（两者的输出里没有字节数据，卡片显示阶段而非百分比）：
+winget 走「先搜后装」——模糊词命中多个包时先把候选列表交给模型，选定后以完整 ID 安装；
+完成后带一句结果备注（如「已安装 jq 1.8.2；PATH 已更新，重启 shell 后生效」）。
 
 - 卡片上的「取消」会终止下载并保留半成品；
 - 完成后卡片给「打开 / 文件夹 / 复制路径」；
@@ -117,8 +122,8 @@ hana-downloader-app/
 ├── sdk/                官方 SDK dist（77 个 .js，随 app 分发，不装 npm 包）
 ├── engine/
 │   ├── server.js       受管下载引擎：HTTP 面 + 卡片绑定表
-│   ├── dlcore.js       下载内核（HTTP 下载 / 断点续传 / git / pnpm 进度解析）
-│   └── progress-parsers.js
+│   ├── dlcore.js       下载内核（HTTP 下载 / 断点续传 / git / pnpm / winget / pip 四条命令链路）
+│   └── progress-parsers.js  输出解析（git / pnpm / winget / pip / uv + winget 退出码表）
 ├── ui/
 │   ├── card.html / card.js        聊天流进度卡
 │   ├── manager.html / manager.js  跨会话管理器
