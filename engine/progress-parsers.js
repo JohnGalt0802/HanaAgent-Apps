@@ -234,15 +234,16 @@ export function classifyWingetExit(rawCode) {
 }
 
 // ── winget search 表格解析（/command 的候选流程用）──
-// 实机输出列宽随内容自适应，两种形态都要兼容：
+// 实机输出列宽随内容自适应，间距可能复杂多变：
 //   A) 宽表（多结果、带匹配理由）：名称  ID  版本  匹配  源
-//   B) 窄表（单结果/精确命中，匹配列消失、列间缩成 1 空格）：
-//        名称 ID        版本  源
-//        ----------------------------
-//        jq   jqlang.jq 1.8.2 winget
-// 解析策略：先按 2+ 空格分段拿名称；在名称之后的文本里用“像 ID 的 token”锚定 ID
-//（含字母、含点、无空白），ID 后面的 token 若含数字则当版本。解析不出的行跳过
-//（候选列表少几条不致命；曾因只信 2+ 空格分列而在窄表上全军覆没，2026-09-18 修）。
+//   B) 窄表（单结果/精确命中）：列间缩成 1 空格，且“名称与 ID 之间也可能是 1 空格”：
+//        名称               ID                           版本       源
+//        ------------------------------------------------------------------
+//        Sysinternals Suite Microsoft.Sysinternals.Suite 2026-07-09 winget
+// 由于分隔空格数不可靠，改为 **ID token 锚定**：行内 token 化（空白分隔），
+// 从右往左找第一个“像 ID 的 token”（含字母、含点、无其它杂字符——纯数字版本号
+// 与日期版本如 2026-07-09 自然被排除）。ID 之前拼为名称，之后的 token 含数字则当版本。
+// 取“最后一个”而非第一个：名称里可能自带像 ID 的 token（如 Node.js），真 ID 更靠后。
 const WG_ID_LIKE = /^[A-Za-z0-9][A-Za-z0-9._+~-]*$/;
 function isWingetIdToken(tok) {
   if (!tok || tok.length < 3) return false;
@@ -264,20 +265,17 @@ export function parseWingetSearch(text) {
       continue;
     }
     if (!line.trim()) continue;
-    const cols = line.split(/\s{2,}/).map((s) => s.trim()).filter(Boolean);
-    if (!cols.length) continue;
-    const name = cols[0];
-    const tokens = cols.slice(1).join(" ").split(/\s+/).filter(Boolean);
-    let id = null, version = "";
-    for (let i = 0; i < tokens.length; i++) {
-      if (isWingetIdToken(tokens[i])) {
-        id = tokens[i];
-        const next = tokens[i + 1];
-        if (next && /\d/.test(next)) version = next;
-        break;
-      }
+    const tokens = line.split(/\s+/).filter(Boolean);
+    if (tokens.length < 2) continue;
+    let idIdx = -1;
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      if (isWingetIdToken(tokens[i])) { idIdx = i; break; }
     }
-    if (!id) continue;
+    if (idIdx <= 0) continue; // 找不到 ID，或 ID 在行首（缺名称，视为坏行）
+    const name = tokens.slice(0, idIdx).join(" ");
+    const id = tokens[idIdx];
+    const next = tokens[idIdx + 1];
+    const version = next && /\d/.test(next) ? next : "";
     out.push({ name, id, version });
   }
   return out;

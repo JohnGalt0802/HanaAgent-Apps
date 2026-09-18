@@ -315,8 +315,9 @@ function render(t) {
   // 进度数据组（百分比 · 已下载/总量 · 速度）：2026-09-17 从进度条右侧上移到这一行（进度条上面那行），
   // 紧邻操作按钮之前；进度条自己独占下面一行。
   html += '<span class="dl-progress-top">';
-  if (!pkgTask || done) html += '<span class="dl-pct">' + esc(pctText) + "</span>";
-  if (!pkgTask) html += '<span class="dl-size">' + esc(sizeText) + "</span>";
+  // 阶段式任务（winget/pip）默认收起数字区；一旦有真实字节数据（下载探测到的进度）就照常显示
+  if (!pkgTask || done || known) html += '<span class="dl-pct">' + esc(pctText) + "</span>";
+  if (!pkgTask || known) html += '<span class="dl-size">' + esc(sizeText) + "</span>";
   if (speedText) html += '<span class="dl-speed">' + esc(speedText) + "</span>";
   html += "</span>";
 

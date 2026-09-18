@@ -244,8 +244,8 @@ import { hana } from "./assets/sdk.js";
       var metaBits = [];
       var isPkg = t.cmdType === "winget-install" || t.cmdType === "pip-install";
       if (t.state === "running") {
-        if (isPkg) {
-          // 阶段式任务：无速度/字节，显示阶段文案（2026-09-18）
+        if (isPkg && !t.total) {
+          // 阶段式任务：暂无字节数据时显示阶段文案（2026-09-18）；有下载探测数据后走字节显示
           metaBits.push(STAGE_TEXT[t.stage] || "安装中");
         } else {
           if (t.speed) metaBits.push(fmtSpeed(t.speed));

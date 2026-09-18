@@ -9,6 +9,8 @@ import https from "node:https";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
+import { startWingetProbe } from "./download-probe.js";
+import { createTunnelAgent } from "./tunnel-agent.js";
 
 const TASKS_FILE = "tasks.json";
 const SPEED_CACHE_FILE = "speed-cache.json";
@@ -661,6 +663,13 @@ class TaskManager {
     }
     task.child = child;
 
+    // winget 下载进度旁路探测（2026-09-18）：CLI 不给下载进度，改为观测它的落盘文件；
+    // 失败静默，不影响任务本身。pip / git / pnpm 不走此路。
+    let stopProbe = null;
+    if (task.cmd?.type === "winget-install") {
+      try { stopProbe = startWingetProbe(task, this.dataDir, resolveProxy(this.dataDir)); } catch { /* 探测失败不影响任务 */ }
+    }
+
     const feed = (chunk) => {
       const text = Buffer.isBuffer(chunk) ? chunk.toString("utf-8") : String(chunk);
       task._lastProgressAt = Date.now(); // 喂停滞监视器
@@ -703,6 +712,7 @@ class TaskManager {
     child.on("error", (e) => { task._spawnError = e; });
 
     child.on("close", (code) => {
+      if (stopProbe) { try { stopProbe(); } catch { /* 忽略 */ } }
       this._stopStallMonitor(task);
       const aborted = task.cancelRequested;
       if (aborted) {
@@ -1342,39 +1352,8 @@ function readSmallBody(res) {
   });
 }
 
-// 手写 HTTP CONNECT 隧道 Agent（https.Agent 负责后续 TLS）
-function createTunnelAgent(proxyUrl) {
-  let pu;
-  try { pu = new URL(proxyUrl); } catch { return null; }
-  if (pu.protocol !== "http:" && pu.protocol !== "https:") return null;
-  const port = Number(pu.port) || (pu.protocol === "http:" ? 80 : 443);
-  const agent = new https.Agent({ keepAlive: false });
-  agent.createConnection = function (options, cb) {
-    const host = options.host;
-    const targetPort = options.port || 443;
-    const socket = net.connect(port, pu.hostname, function () {
-      const cReq = http.request({
-        host: pu.hostname,
-        port: port,
-        method: "CONNECT",
-        path: host + ":" + targetPort,
-        headers: { Host: host + ":" + targetPort },
-      });
-      cReq.once("connect", function (cRes, tunnel) {
-        if (!cRes.statusCode || cRes.statusCode !== 200) {
-          tunnel.destroy();
-          cb(new Error("代理 CONNECT 失败: " + (cRes.statusCode || "?")));
-          return;
-        }
-        cb(null, tunnel);
-      });
-      cReq.once("error", function (err) { cb(err); });
-      cReq.end();
-    });
-    socket.once("error", function (err) { cb(err); });
-  };
-  return agent;
-}
+// 手写 HTTP CONNECT 隧道 Agent 已抽到 ./tunnel-agent.js（URL 下载与 winget 探测共用）
+// 原实现（https.Agent + createConnection 手写 CONNECT）见该文件。
 
 class AbortError extends Error {
   constructor(msg) {
