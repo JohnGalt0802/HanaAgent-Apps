@@ -225,6 +225,10 @@ export function classifyWingetExit(rawCode) {
     case 0x8A150105: return { state: "failed", error: "磁盘空间不足" };
     case 0x8A150102: return { state: "failed", error: "已有其他安装在进行中" };
     case 0x8A15010A: return { state: "failed", error: "需先重启系统再重新安装" };
+    // WinINet / 网络层错误（winget 下载失败时直接抛出的底层码，2026-09-18 实测 0x80072EE2）
+    case 0x80072EE2: return { state: "failed", error: "下载超时，无法连接下载服务器" };
+    case 0x80072EFD: return { state: "failed", error: "无法连接下载服务器" };
+    case 0x80072EE7: return { state: "failed", error: "下载服务器域名解析失败" };
     default: return null;
   }
 }

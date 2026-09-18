@@ -284,7 +284,7 @@ function render(t) {
 
   // 2026-09-17：速度从 meta 里移出，与百分比/大小合成「数据组」，统一放到进度条上面那行。
   const metaParts = [];
-  if (t.stalled) metaParts.push("连接停滞，等待 Agent 决策");
+  if (t.stalled && !terminal) metaParts.push("连接停滞，等待 Agent 决策");
   if (etaText) metaParts.push(etaText);
   if (pending) metaParts.push("准备中…");
   if (running && t.stage && STAGE_TEXT[t.stage]) metaParts.push(STAGE_TEXT[t.stage]);
@@ -303,7 +303,10 @@ function render(t) {
   // 全文在展开区的「状态」行。2026-09-14：原本独占卡片底部一行。
   const errText = (state === "failed" || state === "canceled" || state === "interrupted")
     ? (t.error || "下载失败") : "";
-  const lineText = errText || metaText;
+  // 信息行：错误优先、其次阶段/备注；与徽标文案重复时省略（如 winget 下载阶段两处都是「下载中」）；
+  // 错误里的换行压成空格，避免撑破单行布局（全文仍在 title 里）
+  let lineText = errText ? errText.replace(/\s*\n\s*/g, " ") : metaText;
+  if (lineText === badge) lineText = "";
   if (lineText) {
     html += '<span class="dl-meta' + (errText ? " err" : "") + '"'
       + (errText ? ' title="' + esc(errText) + '"' : "") + ">" + esc(lineText) + "</span>";

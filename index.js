@@ -384,10 +384,16 @@ export default defineApp(async (sdk) => {
 
         const snap = r.snap || r;
         const pct = snap.total ? Math.round((snap.received / snap.total) * 100) : null;
+        // winget / pip 是阶段式任务：没有字节数据，改报当前阶段（2026-09-18）
+        const isPkg = snap.cmdType === "winget-install" || snap.cmdType === "pip-install";
+        const stageCn = { found: "查找包", downloading: "下载中", verifying: "校验哈希", installing: "安装中", collecting: "解析依赖", finalizing: "收尾" }[snap.stage] || snap.stage;
         const text = [
           `状态：${snap.state}`,
           `文件：${snap.fileName || "?"}`,
-          pct == null ? `已下载：${snap.received ?? "?"} 字节` : `进度：${pct}%（${snap.received}/${snap.total} 字节）`,
+          isPkg
+            ? (snap.stage ? `阶段：${stageCn}` : null)
+            : (pct == null ? `已下载：${snap.received ?? "?"} 字节` : `进度：${pct}%（${snap.received}/${snap.total} 字节）`),
+          snap.note ? `备注：${snap.note}` : null,
           snap.error ? `错误：${snap.error}` : null,
         ].filter(Boolean).join("\n");
 
