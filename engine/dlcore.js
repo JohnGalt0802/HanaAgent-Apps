@@ -263,11 +263,16 @@ class TaskManager {
     return task;
   }
 
-  // ── 后台下载循环 ──
+  // ── 停滞监视 ──
+  // 检查间隔必须是阈值的分数，不能等于阈值：
+  // 原来写成 setInterval(fn, stallTimeoutMs)，第一次 tick 时差值是
+  // “阈值 − 首包到达耗时”，永远差那么一点点，于是要等第二次 tick——
+  // 实测 30s 阈值实际 60s 才报卡滞（2026-09-20 第三方七象限测试的“停滞很久”就是它）。
   _startStallMonitor(task) {
     // 人为限速（speedLimit>0）的任务不报停滞：throttle 主动 pause 流的间歇不是网络异常，
     // 误判会在低速率下必性触发假 stall 通知（v0.13.1，9-08 实测 250B/s 任务 1s 即报）。
     if (task.speedLimit > 0) return;
+    const interval = Math.max(500, Math.min(5000, Math.floor((task.stallTimeoutMs || 30000) / 4)));
     task._stallTimer = setInterval(() => {
       try {
         if (task.state !== "running") return;
@@ -286,7 +291,7 @@ class TaskManager {
           task.stallNotified = false;
         }
       } catch { /* 停滞判定异常不影响下载 */ }
-    }, Math.max(100, task.stallTimeoutMs || 30000));
+    }, interval);
     if (task._stallTimer?.unref) task._stallTimer.unref();
   }
 

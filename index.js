@@ -246,29 +246,63 @@ export default defineApp(async (sdk) => {
     }
   }
 
+  // ── sessionPath → sessionId 解析（2026-09-20）────────────────
+  // 为什么需要它：宿主的 session:send-custom 只认 sessionId。只给 sessionPath 会报
+  //   Session manifest resolution requires sessionId or legacy sessionPath.
+  // 根因是宿主内部字段不一致：ro() 把 sessionPath 包成 { legacySessionPath } 交给
+  // SessionManifestResolver，而那个 resolver 只认 e.sessionPath || e.path（见 _Pt），
+  // 于是拿不到路径就抛错。这是宿主 0.1013.2 的实现现状，见踩坑记录第 36 条。
+  //
+  // 所以「按会话路径投递」只能在 App 换成 sessionId。工具 execute 期间有会话上下文，
+  // 就在这里查一次并随任务存下去，后续所有通知（卡滞 / 重试）都靠它。
+  // 进程内缓存：同一个会话的后续调用直接命中，不必反复拉列表。
+  const sessionIdCache = new Map();
+  async function resolveSessionId(sessionPath) {
+    if (!sessionPath) return null;
+    if (sessionIdCache.has(sessionPath)) return sessionIdCache.get(sessionPath);
+    let id = null;
+    try {
+      const r = await sdk.sessions.list({});
+      const arr = Array.isArray(r) ? r : (r?.sessions || r?.items || r?.list || []);
+      const hit = (Array.isArray(arr) ? arr : []).find((s) => s && (s.path === sessionPath || s.sessionPath === sessionPath));
+      id = hit?.sessionId || hit?.id || null;
+    } catch (e) {
+      err(`resolveSessionId ERR | ${e?.message || e}`);
+    }
+    if (id) { sessionIdCache.set(sessionPath, id); log(`sessionId resolved | ${id}`); }
+    else log(`sessionId unresolved | ${sessionPath}`);
+    return id;
+  }
+
   // ── 往原会话投一条隐藏记录（2026-09-20）──────────────────────
   // 两处用它：UI 发起的重试跑完的结果、以及任务卡滞需要 agent 决策的提醒。
   // 两者都需要「不依赖 callToken」的投递——工具 execute 早已结束，宿主任务面（sdk.tasks）用不了。
   //
   // 三个关键点：
+  //   sessionId      必须给（只给 sessionPath 会被宿主拒绝，见 resolveSessionId 的注释）。
   //   scope: "all"   目标会话不属于本 App；缺省的 scope:"own" 会被宿主直接拒（校验点在
   //                  app-host 的会话归属检查里，错误文案是 does not belong to app）。
   //   能力          scope:all + manage 需要 app/sessions.manage；triggerTurn 需要
   //                  app/session.start-turn。两者清单里都已声明。
   //   customType    会被宿主加前缀成 app:hana-downloader/<name>。**别用 download**——
   //                  清单里的 messageRenderers 声明着它，会把消息渲染成一张多余卡片。
-  async function notifySession(sessionPath, text, customType) {
-    if (!sessionPath) { log(`notify skipped (${customType}) | 任务没有会话路径`); return false; }
+  async function notifySession(target, text, customType) {
+    const sessionPath = typeof target === "string" ? target : target?.sessionPath;
+    let sessionId = typeof target === "string" ? null : target?.sessionId;
+    // 夹带兜底：任务里没存 sessionId（老任务）时现查一次
+    if (!sessionId) sessionId = await resolveSessionId(sessionPath);
+    if (!sessionId) { log(`notify skipped (${customType}) | 没有 sessionId`); return false; }
     try {
       await sdk.sessions.sendCustom({
-        sessionPath,
+        sessionId,
+        sessionPath: sessionPath || undefined,
         content: text,
         customType: customType || "retry-note",
         display: false,
         triggerTurn: true,
         scope: "all",
       });
-      log(`notify sent (${customType}) | ${sessionPath}`);
+      log(`notify sent (${customType}) | ${sessionId}`);
       return true;
     } catch (e) {
       err(`notify ERR (${customType}) | ${e?.message || e}`);
@@ -302,7 +336,7 @@ export default defineApp(async (sdk) => {
     if (snap.filePath) lines.push(`路径：${snap.filePath}`);
     if (snap.note) lines.push(`备注：${snap.note}`);
     if (snap.error) lines.push(`错误：${snap.error}`);
-    await notifySession(sessionPath, lines.join("\n"), "retry-note");
+    await notifySession({ sessionId: snap.sessionId, sessionPath }, lines.join("\n"), "retry-note");
   }
 
   // ── 卡滞守望（2026-09-20）───────────────────────────────────
@@ -335,7 +369,8 @@ export default defineApp(async (sdk) => {
       notifiedStalls.add(key);
       if (silent) continue; // 启动首扫：存量只登记，不回放
       const sp = snap.sessionPath;
-      if (!sp) { log(`stall notify skipped | ${snap.taskId} 没有会话路径`); continue; }
+      const sid = snap.sessionId;
+      if (!sp && !sid) { log(`stall notify skipped | ${snap.taskId} 没有会话标识`); continue; }
       const secs = snap.stalledAt ? Math.round((Date.now() - snap.stalledAt) / 1000) : null;
       const lines = [
         `${RECORD_PREFIX}下载任务停滞，需要你决策（不是工具调用的结果）。`,
@@ -346,7 +381,7 @@ export default defineApp(async (sdk) => {
         snap.filePath ? `目标文件：${snap.filePath}` : null,
         `可选动作：继续等（对端可能自己恢复）；取消（download-cancel ${snap.taskId}）；或者告诉用户先处理别的。`,
       ].filter(Boolean);
-      await notifySession(sp, lines.join("\n"), "download-stall");
+      await notifySession({ sessionId: sid, sessionPath: sp }, lines.join("\n"), "download-stall");
     }
   }
 
@@ -402,14 +437,16 @@ export default defineApp(async (sdk) => {
         const t0 = Date.now();
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
-        log(`download-file invoked | url=${url} callToken=${typeof callToken} sessionPath=${sessionPath || "?"}`);
+        // 会话身份要在 execute 期间锁下来（晚了就没有上下文了，而卡滞/重试的通知都得靠它）
+        const sessionId = await resolveSessionId(sessionPath);
+        log(`download-file invoked | url=${url} callToken=${typeof callToken} sessionPath=${sessionPath || "?"} sessionId=${sessionId || "-"}`);
 
         let r;
         try {
           r = await callEngine("/download", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ url, fileName, saveDir, speedLimit, expectedSha256, callToken, sessionPath, messageId: context?.messageId || null }),
+            body: JSON.stringify({ url, fileName, saveDir, speedLimit, expectedSha256, callToken, sessionPath, sessionId, messageId: context?.messageId || null }),
           });
         } catch (e) {
           err(`engine call ERR | ${e?.message || e}`);
@@ -601,14 +638,15 @@ export default defineApp(async (sdk) => {
       async execute({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, context }) {
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
-        log(`download-command invoked | kind=${kind} callToken=${typeof callToken}`);
+        const sessionId = await resolveSessionId(sessionPath);
+        log(`download-command invoked | kind=${kind} callToken=${typeof callToken} sessionId=${sessionId || "-"}`);
 
         let r;
         try {
           r = await callEngine("/command", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, sessionPath, messageId: context?.messageId || null }),
+            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, sessionPath, sessionId, messageId: context?.messageId || null }),
           });
         } catch (e) {
           return { content: [{ type: "text", text: `发起失败：${e?.message || e}` }], isError: true };

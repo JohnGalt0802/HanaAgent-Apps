@@ -248,6 +248,7 @@ const server = http.createServer(async (req, res) => {
         expectedSha256: b.expectedSha256 ? String(b.expectedSha256).trim().toLowerCase() : undefined,
         stallTimeoutMs: b.stallTimeoutMs || cfg.stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
+        sessionId: b.sessionId || null,
         kind: "url",
       });
       log(`created ${t?.taskId} | ${b.url}`);
@@ -339,6 +340,7 @@ const server = http.createServer(async (req, res) => {
         saveDir: filePath ? path.dirname(filePath) : undefined,
         stallTimeoutMs: b.stallTimeoutMs || loadCfg().stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
+        sessionId: b.sessionId || null,
       });
       log(`created command ${t?.taskId} | ${kind} ${fileName}`);
       return send(200, { ok: true, taskId: t?.taskId, state: t?.state || t?.status, kind: "command", fileName, filePath: filePath || null });
@@ -367,6 +369,7 @@ const server = http.createServer(async (req, res) => {
         state: snap?.state || null,
         queued: snap?.queued === true,
         sessionPath: snap?.sessionPath || null,
+        sessionId: snap?.sessionId || null,
         fileName: snap?.fileName || null,
       });
     } catch (e) {
