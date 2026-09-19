@@ -275,15 +275,18 @@ export default defineApp(async (sdk) => {
   }
 
   // ── 往原会话投一条隐藏记录（2026-09-20）──────────────────────
-  // 两处用它：UI 发起的重试跑完的结果、以及任务卡滞需要 agent 决策的提醒。
+  // 两处用它：UI 发起的重试跑完的结果、以及任务卡滞需要 agent 知道的情况。
   // 两者都需要「不依赖 callToken」的投递——工具 execute 早已结束，宿主任务面（sdk.tasks）用不了。
   //
-  // 三个关键点：
+  // 关键点：
+  //   triggerTurn    **必须是 false**（2026-09-20 用户确认）：这些信息重要到该知道，但没重要到
+  //                  值得打断或另起一轮。「及时」的落点是**把消息拼进会话、等下一次 API 调用读到**，
+  //                  不是立刻唤起模型。会话空闲时它就安静躺着，用户下次说话时进入上下文。
   //   sessionId      必须给（只给 sessionPath 会被宿主拒绝，见 resolveSessionId 的注释）。
   //   scope: "all"   目标会话不属于本 App；缺省的 scope:"own" 会被宿主直接拒（校验点在
   //                  app-host 的会话归属检查里，错误文案是 does not belong to app）。
-  //   能力          scope:all + manage 需要 app/sessions.manage；triggerTurn 需要
-  //                  app/session.start-turn。两者清单里都已声明。
+  //   能力          scope:all + manage 需要 app/sessions.manage；会话正在流式中投递时
+  //                  还需要 app/session.start-turn（消息会进模型上下文）。两者清单里都已声明。
   //   customType    会被宿主加前缀成 app:hana-downloader/<name>。**别用 download**——
   //                  清单里的 messageRenderers 声明着它，会把消息渲染成一张多余卡片。
   async function notifySession(target, text, customType) {
@@ -299,7 +302,7 @@ export default defineApp(async (sdk) => {
         content: text,
         customType: customType || "retry-note",
         display: false,
-        triggerTurn: true,
+        triggerTurn: false,
         scope: "all",
       });
       log(`notify sent (${customType}) | ${sessionId}`);
@@ -382,7 +385,8 @@ export default defineApp(async (sdk) => {
         `已停滞：约 ${secs ?? "?"} 秒（一直没收到新数据）`,
         `当前进度：${snap.received ?? "?"}${snap.total ? "/" + snap.total : ""} 字节`,
         snap.filePath ? `目标文件：${snap.filePath}` : null,
-        `可选动作：继续等（对端可能自己恢复）；取消（download-cancel ${snap.taskId}）；或者告诉用户先处理别的。`,
+        `可选动作：继续等（对端可能自己恢复）；取消（download-cancel ${snap.taskId}）；或者先放着。`,
+        `（这条记录是当时写下的，你读到它时可能已经过时；先用 download-wait ${snap.taskId} 确认当前状态再动手。）`,
       ].filter(Boolean);
       await notifySession({ sessionId: sid, sessionPath: sp }, lines.join("\n"), "download-stall");
     }
