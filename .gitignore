@@ -1,0 +1,19 @@
+# hana-downloader-app · 仓库自带忽略规则
+# 背景：本仓库 2026-09-19 从 HanaAgentAPPs 总仓库按目录拆出（git subtree split），
+# 原来那份忽略规则挂在总仓库根上，拆出来后必须自带一份，否则图标过程稿会变成未跟踪文件。
+
+# 图标设计过程稿（AI 候选图，体积大，不进版本库）
+icon/generated/
+icon/generated-qwen/
+
+# 依赖与临时产物
+node_modules/
+__pycache__/
+_temp/
+*.log
+*.tmp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
