@@ -68,11 +68,17 @@ function saveBind(db) {
 // ── 事件落盘（终态 / 停滞）──
 // app 侧不吃 RPC：轮询会产生持续挂起的连接，把工具回程前的 drain() 堵死。
 // 所以引擎把事件写成文件，app 用 fs 轮询。
+//
+// 字段说明（2026-09-20 补）：sessionPath / sessionId 必须带上——app 侧收到卡滞快照后
+// 要靠它把「任务停滞，需要决策」投回原会话（卡滞发生在工具 execute 早已结束之后，
+// 那条宿主任务通道要 callToken，用不了）。stalledAt 用于 app 侧去重（同一任务两次卡滞是两件事）。
 const summarize = (t) => t ? ({
   taskId: t.taskId, state: t.state || t.status, fileName: t.fileName, url: t.url,
   total: t.total ?? null, received: t.received ?? 0, filePath: t.filePath || null,
   error: t.error || null, canceledBy: t.canceledBy || null,
   cmdType: t.cmd?.type || null, note: t.note || null,
+  sessionPath: t.sessionPath || null, sessionId: t.sessionId || null,
+  stalledAt: t.stalledAt || null,
 }) : null;
 
 try { mgr.onFinal((t) => {

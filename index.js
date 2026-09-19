@@ -246,31 +246,32 @@ export default defineApp(async (sdk) => {
     }
   }
 
-  // ── 重试任务的终态通知（2026-09-20）──────────────────────────
-  // 管理器里的重试按钮是 UI 发起的，没有工具调用的 callToken，所以挂不上宿主任务面
-  // （sdk.tasks.create 需要 callToken）。改走 session:send-custom：往任务原属的会话投一条
-  // 隐藏记录（display:false 不上屏，triggerTurn:true 让 agent 醒来处理）。
+  // ── 往原会话投一条隐藏记录（2026-09-20）──────────────────────
+  // 两处用它：UI 发起的重试跑完的结果、以及任务卡滞需要 agent 决策的提醒。
+  // 两者都需要「不依赖 callToken」的投递——工具 execute 早已结束，宿主任务面（sdk.tasks）用不了。
   //
-  // 两个关键参数：
+  // 三个关键点：
   //   scope: "all"   目标会话不属于本 App；缺省的 scope:"own" 会被宿主直接拒（校验点在
   //                  app-host 的会话归属检查里，错误文案是 does not belong to app）。
   //   能力          scope:all + manage 需要 app/sessions.manage；triggerTurn 需要
   //                  app/session.start-turn。两者清单里都已声明。
-  async function notifyRetryResult(sessionPath, text) {
-    if (!sessionPath) { log("retry notify skipped | 任务没有会话路径"); return false; }
+  //   customType    会被宿主加前缀成 app:hana-downloader/<name>。**别用 download**——
+  //                  清单里的 messageRenderers 声明着它，会把消息渲染成一张多余卡片。
+  async function notifySession(sessionPath, text, customType) {
+    if (!sessionPath) { log(`notify skipped (${customType}) | 任务没有会话路径`); return false; }
     try {
       await sdk.sessions.sendCustom({
         sessionPath,
         content: text,
-        customType: "retry-note",
+        customType: customType || "retry-note",
         display: false,
         triggerTurn: true,
         scope: "all",
       });
-      log(`retry notify sent | ${sessionPath}`);
+      log(`notify sent (${customType}) | ${sessionPath}`);
       return true;
     } catch (e) {
-      err(`retry notify ERR | ${e?.message || e}`);
+      err(`notify ERR (${customType}) | ${e?.message || e}`);
       return false;
     }
   }
@@ -301,7 +302,63 @@ export default defineApp(async (sdk) => {
     if (snap.filePath) lines.push(`路径：${snap.filePath}`);
     if (snap.note) lines.push(`备注：${snap.note}`);
     if (snap.error) lines.push(`错误：${snap.error}`);
-    await notifyRetryResult(sessionPath, lines.join("\n"));
+    await notifySession(sessionPath, lines.join("\n"), "retry-note");
+  }
+
+  // ── 卡滞守望（2026-09-20）───────────────────────────────────
+  // 为什么需要它：卡滞是「需要 agent 决策」的状态（对端停发，继续等还是取消），
+  // 而它发生在工具 execute 早已结束之后——那条路要 callToken，用不了。
+  // 所以改成 App 侧常驻轮询引擎落的 stalled/<taskId>.json，再用 session:send-custom
+  // 把「停了，你来定」投回原会话（triggerTurn:true 会直接唤起一轮）。
+  //
+  // 两条路分工：卡滞叫醒决策，终态（宿主任务面）报告结果。
+  //
+  // 去重：key = taskId#stalledAt。同一个任务两次卡滞是两件事（中间恢复过），各自通知一次。
+  // 启动时先静默扫一遍：stalled/ 里的存量都是历史卡滞，回放只会重复叫醒。
+  const STALL_WATCH_MS = 3000;
+  const notifiedStalls = new Set();
+  let stallTimer = null;
+
+  async function scanStalls(silent = false) {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const dir = path.join(dataDir, "stalled");
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch { return; }
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      let snap = null;
+      try { snap = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")); } catch { continue; }
+      if (!snap?.taskId) continue;
+      const key = `${snap.taskId}#${snap.stalledAt || ""}`;
+      if (notifiedStalls.has(key)) continue;
+      notifiedStalls.add(key);
+      if (silent) continue; // 启动首扫：存量只登记，不回放
+      const sp = snap.sessionPath;
+      if (!sp) { log(`stall notify skipped | ${snap.taskId} 没有会话路径`); continue; }
+      const secs = snap.stalledAt ? Math.round((Date.now() - snap.stalledAt) / 1000) : null;
+      const lines = [
+        `${RECORD_PREFIX}下载任务停滞，需要你决策（不是工具调用的结果）。`,
+        `任务：${snap.fileName || snap.taskId}`,
+        `任务 ID：${snap.taskId}`,
+        `已停滞：约 ${secs ?? "?"} 秒（一直没收到新数据）`,
+        `当前进度：${snap.received ?? "?"}${snap.total ? "/" + snap.total : ""} 字节`,
+        snap.filePath ? `目标文件：${snap.filePath}` : null,
+        `可选动作：继续等（对端可能自己恢复）；取消（download-cancel ${snap.taskId}）；或者告诉用户先处理别的。`,
+      ].filter(Boolean);
+      await notifySession(sp, lines.join("\n"), "download-stall");
+    }
+  }
+
+  function startStallWatcher() {
+    if (stallTimer) return;
+    scanStalls(true)
+      .catch((e) => err(`stall first scan ERR | ${e?.message || e}`))
+      .finally(() => {
+        stallTimer = setInterval(() => {
+          scanStalls().catch((e) => err(`stall scan ERR | ${e?.message || e}`));
+        }, STALL_WATCH_MS);
+      });
   }
 
 // ── 卡片登记 ────────────────────────────────────────────────────
@@ -751,6 +808,7 @@ export default defineApp(async (sdk) => {
       await startEngine();
       await waitEngineReady();
       startWatchdog();
+      startStallWatcher(); // 卡滞要叫醒 agent 决策（2026-09-20）
     } catch (e) {
       err(`engine start ERR | ${e?.message || e}`);
     }
