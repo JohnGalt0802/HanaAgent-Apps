@@ -6,6 +6,7 @@
 //   GET  /wait?taskId=xxx             进度快照
 //   POST /cancel  { taskId, source? } 取消
 //   GET  /list                        全部任务
+//   POST /retry   { taskId }          重试一个终态任务（管理器按钮；URL 任务按断点续传）
 // 由 app 经 ctx.runtime.fetch(runtimeId, path) 访问，服务注册见 manifest 的 service 参数。
 import http from "node:http";
 import fs from "node:fs";
@@ -33,6 +34,8 @@ function loadCfg() {
 
 const mgr = getTaskManager(DATA_DIR);
 try { mgr.restore(); } catch (e) { log(`restore ERR ${e?.message || e}`); }
+// 启动即灌一次运行上限（并发与默认限速），改设置后每次发起前再灌一次
+try { mgr.applyConfig(loadCfg()); } catch (e) { log(`applyConfig ERR ${e?.message || e}`); }
 
 // ── 卡片绑定表（bindings.json）──
 // 见下方 /bind、/register-card 两个端点。
@@ -226,6 +229,7 @@ const server = http.createServer(async (req, res) => {
     if (!b.url) return send(400, { error: "url required" });
     try {
       const cfg = loadCfg();
+      mgr.applyConfig(cfg); // 并发上限与默认限速（管理器设置，2026-09-20）
       // 默认保存目录：任务未显式指定时套用全局设置。
       // agentChooses=true 表示“由助手每次决定”，此时不套用固定目录。
       const cfgSaveDir = (!b.saveDir && !cfg.agentChooses && cfg.defaultSaveDir) ? String(cfg.defaultSaveDir) : null;
@@ -318,6 +322,7 @@ const server = http.createServer(async (req, res) => {
       } else {
         return send(400, { error: `不支持的命令类型：${kind}（支持 git-clone / pnpm-install / winget-install / pip-install）` });
       }
+      mgr.applyConfig(loadCfg()); // 并发上限对命令型同样生效（2026-09-20）
       const t = await mgr.create({
         kind: "command",
         cmd,
@@ -333,6 +338,33 @@ const server = http.createServer(async (req, res) => {
       return send(200, { ok: true, taskId: t?.taskId, state: t?.state || t?.status, kind: "command", fileName, filePath: filePath || null });
     } catch (e) {
       log(`command ERR ${e?.message || e}`);
+      return send(500, { error: String(e?.message || e) });
+    }
+  }
+
+  if (req.method === "POST" && u.pathname === "/retry") {
+    const b = await readBody();
+    if (!b.taskId) return send(400, { error: "taskId required" });
+    try {
+      // 先清上一轮的终态痕迹再重跑：否则 app 侧的轮询会先读到旧快照，把这一次当成“已完成”
+      for (const d of ["finished", "stalled"]) {
+        try { fs.unlinkSync(path.join(DATA_DIR, d, `${b.taskId}.json`)); } catch { /* 本来就没有 */ }
+      }
+      mgr.applyConfig(loadCfg());
+      const r = mgr.retry(b.taskId);
+      if (!r.ok) return send(400, r);
+      const snap = mgr.snapshot(b.taskId);
+      log(`retry ${b.taskId} | state=${snap?.state}`);
+      return send(200, {
+        ok: true,
+        taskId: b.taskId,
+        state: snap?.state || null,
+        queued: snap?.queued === true,
+        sessionPath: snap?.sessionPath || null,
+        fileName: snap?.fileName || null,
+      });
+    } catch (e) {
+      log(`retry ERR ${e?.message || e}`);
       return send(500, { error: String(e?.message || e) });
     }
   }
@@ -401,6 +433,8 @@ const server = http.createServer(async (req, res) => {
         const next = { ...loadCfg(), ...(b && typeof b === "object" ? b : {}) };
         fs.mkdirSync(DATA_DIR, { recursive: true });
         fs.writeFileSync(CFG_FILE, JSON.stringify(next, null, 2), "utf8");
+        // 改设置即时生效：把新的并发上限与默认限速灌进任务管理器，不等下一次发起
+        try { mgr.applyConfig(next); } catch (e2) { log(`applyConfig ERR ${e2?.message || e2}`); }
         return send(200, { ok: true, settings: next });
       } catch (e) { return send(500, { error: String(e?.message || e) }); }
     }

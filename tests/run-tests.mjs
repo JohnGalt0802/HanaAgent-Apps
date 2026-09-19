@@ -19,6 +19,7 @@ const SUITES = [
   ["unit-probe.mjs", "winget 下载进度探测（本地 HTTP + 伪造下载目录）"],
   ["unit-display.mjs", "展示层单一来源（阶段/单位文案、任务形态判定、进度文案）"],
   ["unit-download.mjs", "下载内核端到端（落盘 / SHA-256 校验 / 限速 / 记录清理）"],
+  ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
 ];
 
 function run(file) {

@@ -14,12 +14,13 @@ import { createTunnelAgent } from "./tunnel-agent.js";
 
 const TASKS_FILE = "tasks.json";
 const MAX_TASKS = 64;
+const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 const SPEED_SAMPLE_MS = 700;   // 测速采样间隔
 const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
 const CHUNK_SLEEP_MIN_MS = 1;  // 限速时 chunk 间最小等待
 
 let _instance = null;
-const MGR_VER = 22; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码：prepare/startPending/onceFinal/mark*/速度缓存）
+const MGR_VER = 23; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -51,17 +52,22 @@ class TaskManager {
     this.tasks = new Map();
     this._finalCb = null;
     this._stallCb = null;
+    // 运行上限（管理器设置灌入，见 applyConfig）
+    this._maxConcurrent = DEFAULT_MAX_CONCURRENT;
+    this._defaultSpeedLimit = 0;
   }
 
   // 注册终态回调（done/failed/canceled）：server.js 用它把终态与停滞落盘到 finished/ 与 stalled/。
   onFinal(cb) { this._finalCb = typeof cb === "function" ? cb : null; }
 
   _fireFinal(task) {
-    if (!this._finalCb || !task) return;
+    if (!task) return;
     const s = task.state;
-    if (s === "done" || s === "failed" || s === "canceled" || s === "interrupted") {
+    if (this._finalCb && (s === "done" || s === "failed" || s === "canceled" || s === "interrupted")) {
       try { this._finalCb(task); } catch { /* 通知失败不影响下载 */ }
     }
+    // 终态腾出槽位：放行下一个排队任务（2026-09-20）
+    this._pumpQueue();
   }
 
   // 注册停滞回调：无新数据超过 stallTimeoutMs 时触发一次（进度恢复后可再次触发）。
@@ -90,14 +96,107 @@ class TaskManager {
     }
   }
 
-  // ── 创建并立即启动任务 ──
+  // ── 创建任务（可能排队，见 applyConfig）──
   create({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind = "url", cmd = null, unit = "bytes", filePath, resumable = true, expectedSha256 = null }) {
-    const task = this._createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256 });
-    this._run(task); // 后台执行，不等待
+    const task = this._createTask({ url, fileName, saveDir, speedLimit: speedLimit || this._defaultSpeedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256 });
+    this._enqueueOrStart(task);
     return task;
   }
 
-  _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, state, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null }) {
+  // ── 运行上限与排队（2026-09-20）──
+  // 为什么有队列：maxConcurrent 管的是“同时跑几个”，不是“最多记几条”。
+  // 之前 64 只是任务条数上限，同时丢五个大文件下去会互相抢带宽。
+  //
+  // maxConcurrent：同时处于 running 的任务数上限；0 或非法值 = 不限。
+  // speedLimit：任务未显式限速时的默认值（字节/秒）；0 = 不限。
+  // 两项由 server.js 在每次发起前从 engine-config.json 灌进来，改设置即时生效。
+  applyConfig({ maxConcurrent, speedLimit } = {}) {
+    const mc = Number(maxConcurrent);
+    this._maxConcurrent = Number.isFinite(mc) && mc > 0 ? Math.floor(mc) : 0;
+    const sl = Number(speedLimit);
+    this._defaultSpeedLimit = Number.isFinite(sl) && sl > 0 ? sl : 0;
+    this._pumpQueue(); // 上限放宽时立刻放行排队中的任务
+    return { maxConcurrent: this._maxConcurrent, speedLimit: this._defaultSpeedLimit };
+  }
+
+  _runningCount() {
+    let n = 0;
+    for (const t of this.tasks.values()) if (t.state === "running") n += 1;
+    return n;
+  }
+
+  // 槽位够就启动，不够就挂成 pending + queued（卡片与管理器显示“排队中”）
+  _enqueueOrStart(task) {
+    if (this._maxConcurrent > 0 && this._runningCount() >= this._maxConcurrent) {
+      task.state = "pending";
+      task.queued = true;
+      task.queuedAt = Date.now();
+      task.startedAt = null;
+      task.controller = null;
+      this._persist();
+      return;
+    }
+    this._startTask(task);
+  }
+
+  _startTask(task) {
+    task.queued = false;
+    task.queuedAt = null;
+    task.state = "running";
+    task.startedAt = Date.now();
+    task.controller = new AbortController();
+    task._lastProgressAt = Date.now();
+    this._persist();
+    this._run(task); // 后台执行，不等待
+  }
+
+  // 队列泵：按排队先后补足槽位。任务终态（_fireFinal）与设置放宽时各调一次。
+  _pumpQueue() {
+    for (;;) {
+      if (this._maxConcurrent > 0 && this._runningCount() >= this._maxConcurrent) return;
+      let next = null;
+      for (const t of this.tasks.values()) {
+        if (t.state !== "pending" || !t.queued) continue;
+        if (!next || (t.queuedAt || 0) < (next.queuedAt || 0)) next = t;
+      }
+      if (!next) return;
+      this._startTask(next);
+    }
+  }
+
+  // ── 重试（管理器按钮，2026-09-20）──
+  // 只接终态任务。URL 任务的 .part 与断点信息保留，重跑时按续传处理；命令型重跑原命令。
+  // 这是一次全新的运行，所以上一轮的 error / note / 停滞痕迹全部清掉。
+  retry(taskId) {
+    const t = this.tasks.get(taskId);
+    if (!t) return { ok: false, error: "任务不存在" };
+    if (t.state === "running" || t.state === "pending") return { ok: false, error: "任务仍在进行中" };
+    t.error = null;
+    t.note = null;
+    t.stage = null;
+    t.stageDetail = null;
+    t.canceledBy = null;
+    t.cancelRequested = false;
+    t.stalledAt = null;
+    t.stallNotified = false;
+    t.speed = 0;
+    t.elapsed = 0;
+    t.finishedAt = null;
+    t.startedAt = null;
+    t.child = null;
+    t.controller = null;
+    t._samples = [];
+    t._lastPersistAt = 0;
+    t._lastProgressAt = Date.now();
+    t.state = "pending";
+    t.queued = true;
+    t.queuedAt = Date.now();
+    this._persist();
+    this._pumpQueue();
+    return { ok: true, taskId: t.taskId, state: t.state, queued: t.queued === true };
+  }
+
+  _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null }) {
     if (this.tasks.size >= MAX_TASKS) {
       // 清理最老的已结束任务
       for (const [id, t] of this.tasks) {
@@ -123,11 +222,13 @@ class TaskManager {
       fileName: filePath ? path.basename(filePath) : name,
       filePath,
       saveDir: dir,
-      state: state || "running",
+      state: "pending", // 中性初值：由 _enqueueOrStart 决定立即开跑还是排队
+      queued: false, // 排队中（受 maxConcurrent 限制，尚未开始）；由 _enqueueOrStart 置位
+      queuedAt: null,
       total: null,
       received: 0,
       speed: 0,
-      startedAt: state === "pending" ? null : Date.now(),
+      startedAt: null, // 由 _startTask 填
       finishedAt: null,
       elapsed: 0,
       error: null,
@@ -135,7 +236,7 @@ class TaskManager {
       sessionId: sessionId || null,
       sessionRef: sessionRef || null,
       speedLimit: Number.isFinite(speedLimit) && speedLimit > 0 ? speedLimit : 0,
-      controller: state === "pending" ? null : new AbortController(),
+      controller: null, // 由 _startTask 建
       pendingTimer: null,
       _samples: [],
       stalledAt: null,
@@ -666,6 +767,7 @@ class TaskManager {
     if (!t) return { ok: false, error: "任务不存在" };
     if (t.state === "pending") {
       if (t.pendingTimer) clearTimeout(t.pendingTimer);
+      t.queued = false;
       t.state = "canceled";
       t.canceledBy = source;
       t.error = "已取消";
@@ -703,6 +805,7 @@ class TaskManager {
       fileName: t.fileName,
       filePath: t.filePath,
       state: t.state,
+      queued: t.queued === true,
       canceledBy: t.canceledBy || null,
       stalled: t.stalledAt != null,
       stalledAt: t.stalledAt,

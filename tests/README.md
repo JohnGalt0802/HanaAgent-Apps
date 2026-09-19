@@ -22,6 +22,7 @@ node tests/run-tests.mjs
 | `unit-probe.mjs` | winget 下载进度探测：HEAD 跟随重定向取总大小、下载目录文件增长 → received、终态自停、无目录时不炸。10 项 |
 | `unit-display.mjs` | `ui/shared/display.js`：阶段/单位表、任务形态判定（兼容快照与任务对象两种形态）、三类进度文案 |
 | `unit-download.mjs` | 下载内核端到端：落盘完整性、**SHA-256 校验**（对/错两条路）、**限速**是否真拖慢、记录清理。需要约 8 秒 |
+| `unit-queue.mjs` | 并发队列与重试：maxConcurrent 排队与自动放行、放宽上限后立即开跑、失败→重试→成功、在途拒绝重试、排队任务可取消、默认限速套用。需要约 10 秒 |
 
 ## servers/ — 手工验证用的本地下载源
 

@@ -286,7 +286,7 @@ function render(t) {
   const metaParts = [];
   if (t.stalled && !terminal) metaParts.push("连接停滞，等待 Agent 决策");
   if (etaText) metaParts.push(etaText);
-  if (pending) metaParts.push("准备中…");
+  if (pending) metaParts.push(t.queued ? "排队中…" : "准备中…");
   // 计数型任务（pnpm 等）：优先显示真实计数明细，没有明细才退回阶段名（2026-09-19）
   if (running && t.stageDetail) metaParts.push(t.stageDetail);
   else if (running && t.stage && STAGE_TEXT[t.stage]) metaParts.push(STAGE_TEXT[t.stage]);

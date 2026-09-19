@@ -40,6 +40,8 @@ const READY_WAIT_MS = 25000;
 const WATCHDOG_INTERVAL_MS = 30000;
 const SETTLE_POLL_INTERVAL_MS = 2000;
 const SETTLE_MAX_POLLS = 900;
+// 重试任务的通知守望：6 小时（2s × 10800）。重试可能是几十 GB 的大文件，30 分钟不够。
+const RETRY_NOTIFY_MAX_POLLS = 10800;
 const MAX_ANNOUNCE_PER_HOUR = 30;
 
 const RULE_MARK = "【下载铁律】";
@@ -242,6 +244,64 @@ export default defineApp(async (sdk) => {
     } catch (e) {
       err(`tasks settle ERR | ${hostTaskId} | ${e?.message || e}`);
     }
+  }
+
+  // ── 重试任务的终态通知（2026-09-20）──────────────────────────
+  // 管理器里的重试按钮是 UI 发起的，没有工具调用的 callToken，所以挂不上宿主任务面
+  // （sdk.tasks.create 需要 callToken）。改走 session:send-custom：往任务原属的会话投一条
+  // 隐藏记录（display:false 不上屏，triggerTurn:true 让 agent 醒来处理）。
+  //
+  // 两个关键参数：
+  //   scope: "all"   目标会话不属于本 App；缺省的 scope:"own" 会被宿主直接拒（校验点在
+  //                  app-host 的会话归属检查里，错误文案是 does not belong to app）。
+  //   能力          scope:all + manage 需要 app/sessions.manage；triggerTurn 需要
+  //                  app/session.start-turn。两者清单里都已声明。
+  async function notifyRetryResult(sessionPath, text) {
+    if (!sessionPath) { log("retry notify skipped | 任务没有会话路径"); return false; }
+    try {
+      await sdk.sessions.sendCustom({
+        sessionPath,
+        content: text,
+        customType: "retry-note",
+        display: false,
+        triggerTurn: true,
+        scope: "all",
+      });
+      log(`retry notify sent | ${sessionPath}`);
+      return true;
+    } catch (e) {
+      err(`retry notify ERR | ${e?.message || e}`);
+      return false;
+    }
+  }
+
+  // 轮询 finished/<taskId>.json（与 settleWhenDone 同一机制：读文件，不占 RPC），
+  // 终态时把结果投回原会话。引擎在 /retry 里已把上一轮的终态文件删掉，所以这里读到的必是这一次的。
+  async function notifyWhenRetryDone(engineTaskId, sessionPath, label) {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const finishedPath = path.join(dataDir, "finished", `${engineTaskId}.json`);
+    let snap = null;
+    for (let i = 0; i < RETRY_NOTIFY_MAX_POLLS; i++) {
+      await sleep(SETTLE_POLL_INTERVAL_MS);
+      try {
+        if (fs.existsSync(finishedPath)) { snap = JSON.parse(fs.readFileSync(finishedPath, "utf8")); break; }
+      } catch { /* 半写状态，下一轮再读 */ }
+    }
+    if (!snap) { log(`retry notify | 未等到终态 ${engineTaskId}`); return; }
+
+    const name = snap.fileName || label || engineTaskId;
+    const stateCn = snap.state === "done" ? "完成" : snap.state === "canceled" ? "已取消" : "失败";
+    const lines = [
+      `${RECORD_PREFIX}用户在下载管理器里点「重试」的任务已结束（重试发起，不是新的下载请求）。`,
+      `任务：${name}`,
+      `结果：${stateCn}`,
+      `任务 ID：${engineTaskId}`,
+    ];
+    if (snap.filePath) lines.push(`路径：${snap.filePath}`);
+    if (snap.note) lines.push(`备注：${snap.note}`);
+    if (snap.error) lines.push(`错误：${snap.error}`);
+    await notifyRetryResult(sessionPath, lines.join("\n"));
   }
 
 // ── 卡片登记 ────────────────────────────────────────────────────
@@ -610,6 +670,32 @@ export default defineApp(async (sdk) => {
           runtime = { error: String(e?.message || e) };
         }
         return c.json({ runtime });
+      });
+
+      // 重试不走 /engine/* 透传：App 要先拿到引擎的受理结果，再起一个终态守望，
+      // 好在重试跑完后把结果通知回原会话（通知走 session:send-custom，见 notifyRetryResult）。
+      app.post("/retry", async (c) => {
+        let body = {};
+        try { body = await c.req.json(); } catch { /* 空 body 交给引擎报错 */ }
+        let r;
+        try {
+          r = await callEngine("/retry", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body || {}),
+          });
+        } catch (e) {
+          return c.json({ ok: false, error: `引擎不可达：${e?.message || e}` }, 502);
+        }
+        if (r?.ok && r?.taskId) {
+          const sessionPath = r.sessionPath || body?.sessionPath || null;
+          log(`retry accepted | ${r.taskId} | session=${sessionPath || "-"}`);
+          setTimeout(() => {
+            notifyWhenRetryDone(r.taskId, sessionPath, r.fileName)
+              .catch((e) => err(`retry notify ERR | ${e?.message || e}`));
+          }, 300);
+        }
+        return c.json(r);
       });
     });
     log("routes registered | /engine/*, /engine-status");

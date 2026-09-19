@@ -13,7 +13,7 @@ winget / pip）、聊天流内实时进度卡片、跨会话下载管理器。
 
 | 工具 | 用途 |
 | --- | --- |
-| `download-file` | 下载任意 http/https 文件到指定或默认目录，返回 taskId |
+| `download-file` | 下载任意 http/https 文件到指定或默认目录，返回 taskId。可选 `speedLimit`（限速）与 `expectedSha256`（下载后校验，不匹配不交付） |
 | `download-wait` | 查一个任务的进度快照（state / 进度 / 速度），立即返回不阻塞 |
 | `download-cancel` | 取消进行中的任务，半成品保留供续传 |
 | `download-command` | 四种命令：`git-clone` 克隆仓库 / `pnpm-install` 安装依赖 / `winget-install` 装 Windows 软件 / `pip-install` 装 Python 包（支持 venv 解释器与 uv runner） |
@@ -70,6 +70,14 @@ winget 走「先搜后装」——模糊词命中多个包时先把候选列表�
 - 完成后卡片给「打开 / 文件夹 / 复制路径」；
 - 助手可以用 `download-wait` 中途回查进度，也可以什么都不做等完成通知。
 
+**重试与排队**（2026-09-20）：
+
+- 管理器行尾的 ▾ 菜单对失败 / 中断 / 已取消的任务多一项「**重试**」：URL 任务按 `.part` 断点续传，
+  命令型任务重跑原命令。重试跑完会**往原会话投一条隐藏记录**（不上屏，会唤起 agent 去处理），
+  所以重试的结果不会掉在地上。
+- 同时下载数受设置里的「**同时下载上限**」约束（默认 3）：超出上限的任务显示「排队中」，
+  前面的任务一结束就自动补位。不需要人工干预，也不用重发。
+
 ---
 
 ## 四、配置
@@ -81,6 +89,10 @@ winget 走「先搜后装」——模糊词命中多个包时先把候选列表�
 | `defaultSaveDir` | 未显式指定保存目录时用的默认目录 |
 | `agentChooses` | `true` 表示由助手每次自行决定，不套用 `defaultSaveDir` |
 | `stallTimeoutMs` | 连接停滞多久算卡滞（默认由内核决定） |
+| `maxConcurrent` | 同时处于下载中的任务数上限，超出的排队等待；`0` 表示不限（默认 3） |
+| `speedLimit` | 任务没有单独指定限速时的默认值（字节/秒）；`0` 表示不限 |
+
+以上四项都能在管理器右上角的齿轮里改（目录、默认限速、同时下载上限、停滞阈值）。
 
 运行数据目录：`C:\Users\John Galt\.hanako\app-data\hana-downloader\`
 
@@ -224,8 +236,9 @@ cd D:\HanakoWorks\HanaAgentAPPs\hana-downloader-app
 node tests/run-tests.mjs
 ```
 
-覆盖：输出解析器 46 项、winget 下载探测 10 项、展示层单一来源 32 项、
-下载内核端到端 17 项（含 SHA-256 校验与限速两条路）。明细与新增约定见 `tests/README.md`。
+覆盖 130 项：输出解析器 46、winget 下载探测 10、展示层单一来源 32、
+下载内核端到端 17（含 SHA-256 校验与限速两条路）、并发队列与重试 25。
+明细与新增约定见 `tests/README.md`。
 
 七象限投递能力测试（完成 / 取消 / 卡滞 × 未收束 / 已收束 + 卡滞恢复）需要宿主在场，
 最新一轮：宿主 0.978.0、**7/7 完成**，见 `docs/七象限测试报告-20260914.md`
@@ -246,6 +259,8 @@ node tests/run-tests.mjs
 | 工具调用报 `RPC peer closed` | 只 reload 没重启宿主，见第五节与第 14 条 |
 | 工具调用报 `engine fetch failed` | 引擎进程没了：看宿主日志里的 `[hd]` 行；watchdog 每 30s 探活并自动重启 |
 | 下载不动 / 卡在某个百分比 | `download-wait <taskId>` 看阶段；卡滞会落盘到 `{appDataDir}/stalled/` |
+| 任务显示「排队中」一直不动 | 到了「同时下载上限」：在管理器齿轮里调大或设 0（不限），或等前面的任务结束 |
+| 点了重试但 agent 没反应 | 看 App 日志里的 `retry notify`：任务没带会话路径时不会通知（手动造的任务就是这种） |
 | 命令失败但错误文案没信息量 | 第 32 条（失败摘要要抓带错误码的那行） |
 | winget / pip 下不动或装不上 | 第 33 条（各 CLI 的代理行为实测表）、第 25 条 |
 | 改了代码没生效 | `docs/改动生效范围.md`：哪类文件要重启，先过那张表 |

@@ -81,6 +81,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     "/download/clear": { path: "engine/clear", method: "POST" },
     "/download/forget": { path: "engine/forget", method: "POST" },
     "/download/reveal": { path: "engine/reveal", method: "POST" },
+    "/download/retry": { path: "retry", method: "POST" }, // 走 App 路由：App 要起终态守望，好把重试结果通知给 agent
     "/settings": { path: "engine/settings", method: null },
     "/diag": { path: "engine/ping", method: "GET" },
   };
@@ -176,7 +177,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
   function stateMeta(t) {
     switch (t.state) {
       case "running": return { label: "下载中", cls: "st-running" };
-      case "pending": return { label: "准备中", cls: "st-pending" };
+      case "pending": return { label: t.queued ? "排队中" : "准备中", cls: "st-pending" };
       case "done": return { label: "完成", cls: "st-done" };
       case "failed": return { label: "失败", cls: "st-failed" };
       case "canceled": return { label: "已取消", cls: "st-canceled" };
@@ -335,12 +336,15 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
   function ensureRowMenu() {
     if (rowMenuEl) return rowMenuEl;
     rowMenuEl = el("div", "mgr-row-menu");
+    var optRetry = el("button", "mgr-row-menu-opt mgr-row-menu-retry", "重试");
+    optRetry.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) retryTask(t); };
     var opt1 = el("button", "mgr-row-menu-opt", "打开所在文件夹");
     opt1.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) reveal(t); };
     var opt2 = el("button", "mgr-row-menu-opt", "删除记录");
     opt2.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) forgetTask(t, false); };
     var opt3 = el("button", "mgr-row-menu-opt mgr-row-menu-danger", "删除记录及文件");
     opt3.onclick = function (e) { e.stopPropagation(); var t = rowMenuTask; closeRowMenu(); if (t) forgetTask(t, true); };
+    rowMenuEl.appendChild(optRetry);
     rowMenuEl.appendChild(opt1);
     rowMenuEl.appendChild(opt2);
     rowMenuEl.appendChild(opt3);
@@ -356,6 +360,11 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
   function openRowMenu(anchorEl, t) {
     rowMenuTask = t;
     var menu = ensureRowMenu();
+    // 重试只对终态开放：在途任务（running / pending）没有可重试的语义
+    var retryOpt = menu.querySelector(".mgr-row-menu-retry");
+    if (retryOpt) {
+      retryOpt.style.display = (t && (t.state === "interrupted" || t.state === "failed" || t.state === "canceled")) ? "block" : "none";
+    }
     // 定位（fixed 相对视口）
     var r = anchorEl.getBoundingClientRect();
     var mw = menu.offsetWidth || 150;
@@ -627,9 +636,59 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
         .catch(function () { hint("设置失败：网络错误"); });
     };
 
+    // 限速与并发（2026-09-20）：引擎侧早就支持，这里补上入口
+    var opt4 = el("button", "mgr-settings-opt", "默认限速（" + fmtLimit(settings.speedLimit) + "）");
+    opt4.title = "任务自己没有单独限速时用这个值；0 表示不限速";
+    opt4.onclick = function (e) {
+      e.stopPropagation();
+      var cur = settings.speedLimit > 0 ? String(Math.round(settings.speedLimit / 1024)) : "0";
+      var v = window.prompt("默认限速（KB/s，0 = 不限速）", cur);
+      if (v == null) return;
+      var kb = parseFloat(v);
+      if (!isFinite(kb) || kb < 0) { hint("请输入不小于 0 的数字（KB/s）"); return; }
+      saveSetting({ speedLimit: Math.round(kb * 1024) }, menu, kb > 0 ? "已设置默认限速 " + Math.round(kb) + " KB/s" : "已取消默认限速");
+    };
+
+    var opt5 = el("button", "mgr-settings-opt", "同时下载上限（" + (settings.maxConcurrent > 0 ? settings.maxConcurrent + " 个" : "不限") + "）");
+    opt5.title = "同时处于下载中的任务数；超出的排到队列里等待；0 表示不限";
+    opt5.onclick = function (e) {
+      e.stopPropagation();
+      var v = window.prompt("同时下载上限（0 = 不限）", String(settings.maxConcurrent > 0 ? settings.maxConcurrent : 0));
+      if (v == null) return;
+      var n = parseInt(v, 10);
+      if (!isFinite(n) || n < 0) { hint("请输入不小于 0 的整数"); return; }
+      saveSetting({ maxConcurrent: n }, menu, n > 0 ? "已设置同时下载上限 " + n + " 个" : "已取消并发限制");
+    };
+
     menu.appendChild(opt1);
     menu.appendChild(opt2);
     menu.appendChild(opt3);
+    menu.appendChild(opt4);
+    menu.appendChild(opt5);
+  }
+
+  // 设置项的统一保存路径：写引擎设置 → 刷新本地快照 → 重绘菜单
+  function saveSetting(patch, menu, okText) {
+    apiFetch("/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data && data.ok) {
+          settings = data.settings || settings;
+          renderSettingsOptions(menu);
+          closeSettingsMenu();
+          hint(okText || "已保存");
+        } else hint("设置失败：" + ((data && data.error) || "未知错误"));
+      })
+      .catch(function () { hint("设置失败：网络错误"); });
+  }
+
+  function fmtLimit(v) {
+    if (!v || v <= 0) return "不限";
+    return fmtBytes(v) + "/s";
   }
 
   function loadSettings(cb) {
@@ -704,6 +763,22 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     apiFetch("/download/cancel?taskId=" + encodeURIComponent(t.taskId), { method: "POST", cache: "no-store" })
       .then(function () { poll(); })
       .catch(function () {});
+  }
+  // 重试：走 App 的 /retry（不是引擎透传），App 会在受理后起一个终态守望，
+  // 任务结束时往原会话投一条隐藏记录，让 agent 知道重试结果（2026-09-20）
+  function retryTask(t) {
+    if (!t) return;
+    apiFetch("/download/retry", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ taskId: t.taskId }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok) { hint((d && d.error) || "重试失败"); return; }
+        hint(d.queued ? "已重新排队，等前面的任务结束" : "已重新开始");
+        poll();
+      })
+      .catch(function () { hint("重试失败：网络错误"); });
   }
 
   // ── 轮询 ──
