@@ -25,35 +25,42 @@ export function parseGitLine(line) {
   return null;
 }
 
+// pnpm 11.21.0 实测（2026-09-19，管道模式）：
+//   Progress: resolved 31, reused 12, downloaded 19, added 0
+// 逐行输出（无 \r 重绘），且**常见输出里没有 `Packages: +N`**——总包数不可知。
+// 所以这里不再用常量分母伪造百分比：分母未知就不给 total / pct，只报真实计数。
 const PNPM_PROGRESS = /Progress:\s+resolved\s+(\d+),\s+reused\s+(\d+),\s+downloaded\s+(\d+),\s+added\s+(\d+)/;
-const PNPM_PACKAGES = /Packages:\s+\+(\d+)/;
+const PNPM_PACKAGES = /Packages:\s+\+(\d+)/; // 部分版本/场景才有，一旦出现就当作总包数
 const PNPM_BUILD = /postinstall\$/;
 const PNPM_BAS_DONE = /Done in\s+(?:(\d+(?:\.\d+)?)m\s+)?(\d+(?:\.\d+)?)s/;
 
-const PACKAGES_TOTAL = 1000;
-
 export function createPnpmParser() {
-  let packages = null; // 包总数（Packages: +N），用于比例换算
+  let total = null; // 总包数：只有 pnpm 明确给出 Packages: +N 时才知道
+  let received = 0; // 已落地包数（解析 → 下载 → 安装，取推进最远的一档）
   return function (line) {
     if (!line) return null;
     let m;
-    if ((m = line.match(PNPM_PACKAGES))) { packages = +m[1]; return null; }
+    if ((m = line.match(PNPM_PACKAGES))) { total = +m[1]; return null; }
     if ((m = line.match(PNPM_PROGRESS))) {
       const resolved = +m[1], downloaded = +m[3], added = +m[4];
-      let stage, pct;
-      // 同 stage 只取最新：received 直接赋值（不累加），pnpm \r 重绘天然状态化
-      if (added > 0 && packages) { stage = "linking"; pct = 60 + Math.min(20, (added / packages) * 20); }
-      else if (downloaded > 0 && packages) { stage = "fetching"; pct = 10 + Math.min(50, (downloaded / packages) * 50); }
-      else if (resolved > 0) { stage = "resolving-deps"; pct = 5; }
-      else return null;
-      const received = Math.round((pct / 100) * PACKAGES_TOTAL);
-      return {
-        stage, received, total: PACKAGES_TOTAL, unit: "packages", pct: Math.round(pct * 10) / 10,
-        message: stage === "fetching" ? `拉取 ${downloaded}/${packages}` : stage === "linking" ? `链接 ${added}/${packages}` : "解析依赖",
+      const stage = added > 0 ? "linking" : (downloaded > 0 ? "fetching" : "resolving-deps");
+      // received 单调推进：已安装 > 已下载 > 已解析；同一 stage 只取最新，不累加
+      received = Math.max(received, added > 0 ? added : (downloaded > 0 ? downloaded : resolved));
+      const out = {
+        stage, unit: "packages", received,
+        detail: `解析 ${resolved} · 下载 ${downloaded} · 已装 ${added}`,
       };
+      if (total) {
+        out.total = total;
+        out.pct = Math.min(100, Math.round((received / total) * 1000) / 10);
+      }
+      return out;
     }
-    if (PNPM_BUILD.test(line)) return { stage: "building", received: 900, total: PACKAGES_TOTAL, unit: "packages", pct: 90, message: "编译原生模块" };
-    if ((m = line.match(PNPM_BAS_DONE))) return { stage: "finalizing", received: PACKAGES_TOTAL, total: PACKAGES_TOTAL, unit: "packages", pct: 100, message: "收尾" };
+    if (PNPM_BUILD.test(line)) return { stage: "building", unit: "packages", received, detail: "编译原生模块（postinstall）" };
+    if ((m = line.match(PNPM_BAS_DONE))) {
+      if (total) return { stage: "finalizing", unit: "packages", received: total, total, pct: 100, detail: "收尾" };
+      return { stage: "finalizing", unit: "packages", received, detail: "收尾" };
+    }
     return null;
   };
 }

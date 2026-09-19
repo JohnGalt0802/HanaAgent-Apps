@@ -265,7 +265,10 @@ function render(t) {
     || !!(t.cmd && (t.cmd.type === "winget-install" || t.cmd.type === "pip-install"));
   const pct = t.percent;
   const known = t.total != null && t.total > 0;
-  const pctText = done ? "100%" : (known ? (pct == null ? "0" : pct.toFixed(pct >= 100 ? 0 : 1)) + "%" : "—");
+  // 计数型单位（objects / packages / files）在 total 未知时不报 100%：分母本来就不存在（2026-09-19）
+  const pctText = done
+    ? (known || !(t.unit && t.unit !== "bytes") ? "100%" : "—")
+    : (known ? (pct == null ? "0" : pct.toFixed(pct >= 100 ? 0 : 1)) + "%" : "—");
   const unit = t.unit;
   const sizeText = pending ? "—" : (unit && unit !== "bytes")
     ? (t.received != null ? t.received : 0) + (known ? "/" + t.total : "") + (UNIT_NAME[unit] ? " " + UNIT_NAME[unit] : "")
@@ -291,7 +294,9 @@ function render(t) {
   if (t.stalled && !terminal) metaParts.push("连接停滞，等待 Agent 决策");
   if (etaText) metaParts.push(etaText);
   if (pending) metaParts.push("准备中…");
-  if (running && t.stage && STAGE_TEXT[t.stage]) metaParts.push(STAGE_TEXT[t.stage]);
+  // 计数型任务（pnpm 等）：优先显示真实计数明细，没有明细才退回阶段名（2026-09-19）
+  if (running && t.stageDetail) metaParts.push(t.stageDetail);
+  else if (running && t.stage && STAGE_TEXT[t.stage]) metaParts.push(STAGE_TEXT[t.stage]);
   if (done && t.note) metaParts.push(t.note);
   const metaText = metaParts.join(" · ");
 
@@ -358,7 +363,8 @@ function render(t) {
     if (running && t.received != null) {
       sizeDetail += (unit && unit !== "bytes" ? "（已完成 " + t.received + "）" : "（已下载 " + fmtBytes(t.received) + "）");
     }
-    html += '<div class="dl-d-row"><span class="dl-d-label">大小</span><span class="dl-d-value">' + esc(sizeDetail) + "</span></div>";
+    // 计数型（packages/objects/files）的“大小”其实是计数，标签跟着改（2026-09-19）
+    html += '<div class="dl-d-row"><span class="dl-d-label">' + (unit && unit !== "bytes" ? "数量" : "大小") + '</span><span class="dl-d-value">' + esc(sizeDetail) + "</span></div>";
   }
   html += '<div class="dl-d-row"><span class="dl-d-label">任务</span><span class="dl-d-value">' + esc(t.taskId || taskId) + "</span></div>";
   html += '<div class="dl-d-row"><span class="dl-d-label">状态</span><span class="dl-d-value">' + esc(badge) + (metaText ? "（" + esc(metaText) + "）" : "") + "</span></div>";

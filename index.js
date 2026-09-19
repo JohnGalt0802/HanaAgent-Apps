@@ -203,13 +203,22 @@ export default defineApp(async (sdk) => {
     }
 
     const isPkg = snap.cmdType === "winget-install" || snap.cmdType === "pip-install";
+    const isClone = snap.cmdType === "git-clone";
+    const isCmd = isClone || snap.cmdType === "pnpm-install";
+    const name = snap.fileName || label;
+    // 三类任务分开措辞（2026-09-19）：
+    //   URL 下载 → 字节数有意义；命令类（clone/pnpm）received/total 是对象数/包数，不是产物大小；
+    //   包安装（winget/pip）没有可打开产物，只报备注。
+    const verb = isPkg || snap.cmdType === "pnpm-install" ? "安装" : (isClone ? "克隆" : "下载");
     const text = snap.state === "done"
       ? isPkg
-        ? `安装完成：${snap.fileName || label}${snap.note ? `\n${snap.note}` : ""}`
-        : `下载完成：${snap.fileName || label}\n路径：${snap.filePath || "?"}\n大小：${snap.received ?? "?"} 字节`
+        ? `安装完成：${name}${snap.note ? `\n${snap.note}` : ""}`
+        : isCmd
+          ? `${isClone ? "克隆完成" : "依赖安装完成"}：${name}\n路径：${snap.filePath || "?"}`
+          : `下载完成：${name}\n路径：${snap.filePath || "?"}\n大小：${snap.received ?? "?"} 字节`
       : snap.state === "canceled"
-        ? `${isPkg ? "安装" : "下载"}已取消：${snap.fileName || label}`
-        : `${isPkg ? "安装" : "下载"}失败：${snap.fileName || label}${snap.error ? `（${snap.error}）` : ""}`;
+        ? `${verb}已取消：${name}`
+        : `${verb}失败：${name}${snap.error ? `（${snap.error}）` : ""}`;
 
     try {
       if (snap.state === "done") {
@@ -386,13 +395,21 @@ export default defineApp(async (sdk) => {
         const pct = snap.total ? Math.round((snap.received / snap.total) * 100) : null;
         // winget / pip 是阶段式任务：没有字节数据，改报当前阶段（2026-09-18）
         const isPkg = snap.cmdType === "winget-install" || snap.cmdType === "pip-install";
+        // 计数型（git / pnpm）的 received/total 是对象数/包数，不能写成字节（2026-09-19）
+        const UNIT_CN = { objects: "对象", files: "文件", packages: "包" };
+        const countUnit = UNIT_CN[snap.unit] || null;
         const stageCn = { found: "查找包", downloading: "下载中", verifying: "校验哈希", installing: "安装中", collecting: "解析依赖", finalizing: "收尾" }[snap.stage] || snap.stage;
+        const progressLine = isPkg
+          ? (snap.stage ? `阶段：${stageCn}` : null)
+          : countUnit
+            ? (snap.state === "done" && snap.total
+                ? `完成：${snap.received ?? "?"}/${snap.total} ${countUnit}`
+                : `进度：${snap.stageDetail || `${snap.received ?? "?"}${snap.total ? "/" + snap.total : ""} ${countUnit}`}`)
+            : (pct == null ? `已下载：${snap.received ?? "?"} 字节` : `进度：${pct}%（${snap.received}/${snap.total} 字节）`);
         const text = [
           `状态：${snap.state}`,
           `文件：${snap.fileName || "?"}`,
-          isPkg
-            ? (snap.stage ? `阶段：${stageCn}` : null)
-            : (pct == null ? `已下载：${snap.received ?? "?"} 字节` : `进度：${pct}%（${snap.received}/${snap.total} 字节）`),
+          progressLine,
           snap.note ? `备注：${snap.note}` : null,
           snap.error ? `错误：${snap.error}` : null,
         ].filter(Boolean).join("\n");
@@ -433,7 +450,7 @@ export default defineApp(async (sdk) => {
         const snap = r?.snap || r || {};
         const ok = r?.ok !== false;
         const text = ok
-          ? `已取消下载任务 ${id}${snap?.fileName ? `（${snap.fileName}）` : ""}${snap?.partPath ? `，半成品已保留供续传（${snap.partPath}）` : "。"}`
+          ? `已取消任务 ${id}${snap?.fileName ? `（${snap.fileName}）` : ""}${snap?.partPath ? `，半成品已保留供续传（${snap.partPath}）` : "。"}`
           : `取消失败：${r?.error || "任务不存在"}`;
 
         return { content: [{ type: "text", text }], details: { download: { taskId: id, canceled: ok, ...(snap || {}) } } };

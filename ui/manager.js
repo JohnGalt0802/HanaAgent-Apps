@@ -67,6 +67,9 @@ import { hana } from "./assets/sdk.js";
     enumerating: "枚举对象", resolving: "解析增量",
   };
 
+  // 计数单位（与 card.js 同一套）：git 的对象/文件数、pnpm 的包数都不是字节（2026-09-19）
+  var UNIT_NAME = { objects: "对象", files: "文件", packages: "包" };
+
   var POLL_MS = 3000;
   var tasks = [];
   var filter = "all"; // all | active | done | failed
@@ -247,18 +250,22 @@ import { hana } from "./assets/sdk.js";
         if (isPkg && !t.total) {
           // 阶段式任务：暂无字节数据时显示阶段文案（2026-09-18）；有下载探测数据后走字节显示
           metaBits.push(STAGE_TEXT[t.stage] || "安装中");
+        } else if (t.unit && t.unit !== "bytes") {
+          // 计数型（git / pnpm）：received/total 是对象数/包数，不能按字节渲染（2026-09-19）
+          metaBits.push(t.stageDetail || (t.received + (t.total ? "/" + t.total : "" ) + (UNIT_NAME[t.unit] ? " " + UNIT_NAME[t.unit] : "")));
         } else {
           if (t.speed) metaBits.push(fmtSpeed(t.speed));
           metaBits.push(t.total ? (t.percent != null ? t.percent + "%" : "") : fmtBytes(t.received));
         }
       } else if (t.state === "done") {
+        // 2026-09-19：命令类（git clone / pnpm）的 received/total 是对象数/包数，不是产物大小，
+        // 完成行不再按字节渲染；包安装（winget/pip）报备注；URL 下载才报真实大小。
         if (isPkg) {
           if (t.note) metaBits.push(t.note);
-          if (t.elapsed) metaBits.push(fmtDuration(t.elapsed));
-        } else {
+        } else if (t.cmdType !== "git-clone" && t.cmdType !== "pnpm-install") {
           metaBits.push(fmtBytes(t.total || t.received));
-          if (t.elapsed) metaBits.push(fmtDuration(t.elapsed));
         }
+        if (t.elapsed) metaBits.push(fmtDuration(t.elapsed));
       } else if (t.error) {
         metaBits.push(t.error);
       }

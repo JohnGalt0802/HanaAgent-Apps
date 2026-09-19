@@ -643,12 +643,28 @@ class TaskManager {
     this._startStallMonitor(task);
     task._cmdBuf = ""; // 输出缓冲（截断 4KB 供错误摘要）
 
+    // pnpm 读 HTTP_PROXY/HTTPS_PROXY，但不跟随 Windows 系统代理（2026-09-19 实测：
+    // 系统代理开着、env 为空时它走直连并卡死；直连即使通也不稳——并发拉包常报 error(23)，
+    // 单请求实测能拖到 70s+，经代理则是秒级）。
+    // 其余链路各自有代理通道（winget 跟随系统代理但不读 env；curl/pip/uv/git 读 env 由自身处理；
+    // URL 下载走自建隧道），这里只补 pnpm 这一格。
+    const childEnv = { ...process.env };
+    if (task.cmd?.type === "pnpm-install") {
+      const proxy = resolveProxy(this.dataDir);
+      if (proxy) {
+        childEnv.HTTP_PROXY = proxy; childEnv.HTTPS_PROXY = proxy;
+        childEnv.http_proxy = proxy; childEnv.https_proxy = proxy;
+        childEnv.NO_PROXY = "localhost,127.0.0.1,::1";
+        childEnv.no_proxy = childEnv.NO_PROXY;
+      }
+    }
     let child;
     try {
       child = spawn(cmdBin, fullArgs, {
         cwd: task.cmd.workdir || process.cwd(),
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        env: childEnv,
       });
     } catch (err) {
       this._stopStallMonitor(task);
@@ -692,17 +708,16 @@ class TaskManager {
           if (!task.note) task.note = r.note;
           else if (!task.note.includes(r.note)) task.note += `；${r.note}`;
         }
-        if (r.pct != null) {
-          task.stage = r.stage;
-          if (r.unit) task.unit = r.unit;
-          if (r.received != null && r.total != null) {
-            task.received = r.received;
-            task.total = r.total;
-          } else if (r.pct != null && task.total) {
-            task.received = Math.round(task.total * r.pct / 100);
-          }
-        } else if (r.stage) {
-          task.stage = r.stage;
+        // 字段各自独立更新（2026-09-19）：进度解析器可能只给真实计数、不给百分比
+        // （pnpm 的总包数不可知），旧写法要求 pct/unit 同时存在，会把这种真实计数丢掉。
+        if (r.stage) task.stage = r.stage;
+        if (r.unit) task.unit = r.unit;
+        if (r.detail) task.stageDetail = r.detail;
+        if (r.received != null) task.received = r.received;
+        if (r.total != null) task.total = r.total;
+        // 只给百分比、不给计数的历史路径：按已知 total 反推 received
+        if (r.pct != null && r.received == null && task.total) {
+          task.received = Math.round(task.total * r.pct / 100);
         }
       }
     };
@@ -726,8 +741,12 @@ class TaskManager {
         task.state = "done";
         // 完成对齐：进度探测可能在最后一块上落后（外部读到的写盘量滞后于实际），完成即全量。
         // URL 下载本就相等，无副作用。
-        if (task.total != null && task.received != null && task.received < task.total) task.received = task.total;
-        if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
+        // 计数型（objects / packages / files）不做对齐：那不是字节量，反推 total 等于编数据（2026-09-19）。
+        const countUnit = !!task.unit && task.unit !== "bytes";
+        if (!countUnit) {
+          if (task.total != null && task.received != null && task.received < task.total) task.received = task.total;
+          if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
+        }
       } else {
         // 非零退出码先交给链路的分类器（winget 的 HRESULT 码表）：
         // 分类器可把特定非零码判为 done（如“已安装、无可用更新”）或 canceled。
@@ -738,8 +757,10 @@ class TaskManager {
             if (!task.note) task.note = cls.note;
             else if (!task.note.includes(cls.note)) task.note += `；${cls.note}`;
           }
-          if (task.total != null && task.received != null && task.received < task.total) task.received = task.total;
-          if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
+          if (!(!!task.unit && task.unit !== "bytes")) {
+            if (task.total != null && task.received != null && task.received < task.total) task.received = task.total;
+            if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
+          }
         } else if (cls && cls.state === "canceled") {
           task.state = "canceled";
           task.error = cls.error || "已取消";
@@ -751,7 +772,7 @@ class TaskManager {
           const hexSuffix = codeU >= 0x80000000 ? `（0x${codeU.toString(16).toUpperCase()}）` : "";
           const clsMsg = cls && cls.error ? cls.error + "；" : "";
           task.error = (task._spawnError ? task._spawnError.message + "；" : "") + clsMsg
-            + `命令退出码 ${code}` + hexSuffix + (tail ? `：${tail.split(/\n/).slice(-3).join("\n")}` : "");
+            + `命令退出码 ${code}` + hexSuffix + (tail ? `：${summarizeCmdTail(tail)}` : "");
         }
       }
       // 完成备注：把“已安装 <包>”放在最前（winget 成功路径的输出没有成句结果行；
@@ -834,6 +855,7 @@ class TaskManager {
       cmdType: t.cmd?.type || null,
       unit: t.unit || "bytes",
       stage: t.stage || null,
+      stageDetail: t.stageDetail || null,
       note: t.note || null,
       sessionId: t.sessionId || null,
       sessionPath: t.sessionPath || null,
@@ -1298,6 +1320,30 @@ function friendlyError(e) {
   if (low.includes("aborted")) return "请求被中止";
   if (low.includes("content-length") || low.includes("length")) return "响应异常（长度不符）";
   return msg + causeCode;
+}
+
+// ── 命令失败摘要（2026-09-19）──
+// 优先取带错误码的那一行：pnpm 的 [ERR_PNPM_FETCH_404]、git 的 fatal: 等，
+// 它通常比“最后三行”更有信息量。实测样例（装不存在的包）：真正的原因在第一行，
+// 而最后两行只有 “No authorization header was set for the request.”，对用户等于没说。
+function summarizeCmdTail(tail) {
+  const lines = tail.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const errLine = lines.find((l) => /ERR_[A-Z0-9_]+|^fatal:/i.test(l)) || "";
+  if (errLine) {
+    const hint = cmdErrorHint(tail);
+    return hint ? `${errLine}（${hint}）` : errLine;
+  }
+  return lines.slice(-3).join("\n");
+}
+
+// 只对能确定语义的错误码给一句人话，不做过度翻译（2026-09-19）
+function cmdErrorHint(tail) {
+  if (/ERR_PNPM_FETCH_404/.test(tail)) return "包或版本不存在，检查包名";
+  if (/ERR_PNPM_NO_MATCHING_VERSION/.test(tail)) return "该版本不存在";
+  if (/ERR_PNPM_(META_)?FETCH|ERR_PNPM_TARBALL/.test(tail)) return "源不可达，检查网络与代理";
+  if (/ERR_PNPM_PEER_DEP_ISSUES/.test(tail)) return "peer 依赖冲突";
+  if (/fatal: repository .* not found|fatal: could not read from remote/i.test(tail)) return "仓库不存在或无权访问";
+  return "";
 }
 
 // ── 代理支持（无第三方依赖）──
