@@ -7,4 +7,6 @@ const srv = http.createServer((req, res) => {
   setTimeout(() => { try { res.end(); } catch {} }, 150000);
 });
 srv.listen(47653, '127.0.0.1', () => console.log('stall-server on 47653'));
-setTimeout(() => process.exit(0), 240000); // 4分钟自毁，防孤儿
+// 自毁兜底（防孤儿进程）：默认 15 分钟，可用 STALL_KEEP_MS 覆盖。
+// 2026-09-20：原先写死 4 分钟，但七象限要跑“未收束 + 已收束”两次卡滞（每次 150 秒以上），4 分钟不够用。
+setTimeout(() => process.exit(0), Number(process.env.STALL_KEEP_MS || 900000));
