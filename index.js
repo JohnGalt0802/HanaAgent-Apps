@@ -26,9 +26,13 @@
 
 import crypto from "node:crypto";
 import { defineApp } from "./sdk/app-contract/server-client.js";
+// 引擎端口与展示文案都有单一来源，不在这里重写一份：
+//   engine/engine-port.js  端口（server.js 同用）
+//   ui/shared/display.js   阶段/单位文案与任务形态判定（卡片、管理器同用）
+import { ENGINE_PORT } from "./engine/engine-port.js";
+import { isPkgTask, isCloneTask, isCmdTask, progressText } from "./ui/shared/display.js";
 
 const APP_ID = "hana-downloader";
-const ENGINE_PORT = 4317;
 const ENGINE_ENTRY = "engine/server.js";
 
 const PING_TIMEOUT_MS = 3000;
@@ -202,14 +206,15 @@ export default defineApp(async (sdk) => {
       return;
     }
 
-    const isPkg = snap.cmdType === "winget-install" || snap.cmdType === "pip-install";
-    const isClone = snap.cmdType === "git-clone";
-    const isCmd = isClone || snap.cmdType === "pnpm-install";
+    // 任务形态判定统一走 ui/shared/display.js（原先这里、卡片、管理器各判一遍）
+    const isPkg = isPkgTask(snap);
+    const isClone = isCloneTask(snap);
+    const isCmd = isCmdTask(snap);
     const name = snap.fileName || label;
     // 三类任务分开措辞（2026-09-19）：
     //   URL 下载 → 字节数有意义；命令类（clone/pnpm）received/total 是对象数/包数，不是产物大小；
     //   包安装（winget/pip）没有可打开产物，只报备注。
-    const verb = isPkg || snap.cmdType === "pnpm-install" ? "安装" : (isClone ? "克隆" : "下载");
+    const verb = isPkg ? "安装" : isClone ? "克隆" : isCmd ? "安装" : "下载";
     const text = snap.state === "done"
       ? isPkg
         ? `安装完成：${name}${snap.note ? `\n${snap.note}` : ""}`
@@ -271,10 +276,12 @@ export default defineApp(async (sdk) => {
           url: { type: "string", description: "文件下载地址（http/https）" },
           saveDir: { type: "string", description: "可选：保存目录绝对路径。留空则用默认目录。" },
           fileName: { type: "string", description: "可选：自定义保存文件名（含扩展名）。留空则从 URL 推断。" },
+          speedLimit: { type: "number", description: "可选：限速（字节/秒）。不填或 0 表示不限速。适合与其它下载并跑时让出带宽。" },
+          expectedSha256: { type: "string", description: "可选：期望的 SHA-256 十六进制摘要（不区分大小写）。填了则在落盘前校验，不匹配判失败、不交付文件。" },
         },
         required: ["url"],
       },
-      async execute({ url, fileName, saveDir, context }) {
+      async execute({ url, fileName, saveDir, speedLimit, expectedSha256, context }) {
         const t0 = Date.now();
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
@@ -285,7 +292,7 @@ export default defineApp(async (sdk) => {
           r = await callEngine("/download", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ url, fileName, saveDir, callToken, sessionPath, messageId: context?.messageId || null }),
+            body: JSON.stringify({ url, fileName, saveDir, speedLimit, expectedSha256, callToken, sessionPath, messageId: context?.messageId || null }),
           });
         } catch (e) {
           err(`engine call ERR | ${e?.message || e}`);
@@ -392,20 +399,10 @@ export default defineApp(async (sdk) => {
         }
 
         const snap = r.snap || r;
-        const pct = snap.total ? Math.round((snap.received / snap.total) * 100) : null;
-        // winget / pip 是阶段式任务：没有字节数据，改报当前阶段（2026-09-18）
-        const isPkg = snap.cmdType === "winget-install" || snap.cmdType === "pip-install";
-        // 计数型（git / pnpm）的 received/total 是对象数/包数，不能写成字节（2026-09-19）
-        const UNIT_CN = { objects: "对象", files: "文件", packages: "包" };
-        const countUnit = UNIT_CN[snap.unit] || null;
-        const stageCn = { found: "查找包", downloading: "下载中", verifying: "校验哈希", installing: "安装中", collecting: "解析依赖", finalizing: "收尾" }[snap.stage] || snap.stage;
-        const progressLine = isPkg
-          ? (snap.stage ? `阶段：${stageCn}` : null)
-          : countUnit
-            ? (snap.state === "done" && snap.total
-                ? `完成：${snap.received ?? "?"}/${snap.total} ${countUnit}`
-                : `进度：${snap.stageDetail || `${snap.received ?? "?"}${snap.total ? "/" + snap.total : ""} ${countUnit}`}`)
-            : (pct == null ? `已下载：${snap.received ?? "?"} 字节` : `进度：${pct}%（${snap.received}/${snap.total} 字节）`);
+        // 形态判定与文案统一走 ui/shared/display.js：
+        //   winget / pip 是阶段式（无字节数据，只报阶段）；
+        //   计数型（git / pnpm）的 received/total 是对象数/包数，不能写成字节。
+        const progressLine = progressText(snap, { doneText: true });
         const text = [
           `状态：${snap.state}`,
           `文件：${snap.fileName || "?"}`,

@@ -2,7 +2,7 @@
 
 App ID：`hana-downloader` · 当前版本：**1.0.0**（2026-09-13 重构版）
 宿主基线：HanaAgent **0.978.0**（实测；0.970.9 需临时补丁才能出卡，见第七节）
-卡片尺寸：**450 × 32 px**——宽度由卡片上报自定，高度完全跟内容走（见第九节）
+卡片尺寸：**400 × 25 px**——宽度由卡片上报自定，高度完全跟内容走（见第九节）
 
 为 HanaAgent 提供**可观测下载**：任意 URL 下载、命令型安装（git clone / pnpm install /
 winget / pip）、聊天流内实时进度卡片、跨会话下载管理器。
@@ -34,7 +34,7 @@ winget / pip）、聊天流内实时进度卡片、跨会话下载管理器。
 宿主 → 设置 → 应用 → 安装（来源选本地目录）：
 
 ```
-D:\HanakoWorks\hana-downloader-app
+D:\HanakoWorks\HanaAgentAPPs\hana-downloader-app
 ```
 
 首次安装需要在确认页批准。清单里声明的能力：
@@ -89,7 +89,6 @@ tasks.json        任务记录（引擎 restore 用）
 finished/         终态快照，App 侧靠读它结算宿主任务（不走 RPC 轮询）
 stalled/          卡滞标记
 bindings.json     卡片绑定表：pending（待认领）/ bind（cardInstanceId → taskId）
-speed-cache.json  测速缓存
 ```
 
 ---
@@ -117,24 +116,31 @@ speed-cache.json  测速缓存
 
 ```
 hana-downloader-app/
-├── manifest.json       v2 清单：capabilities / network / cards / messageRenderers
+├── manifest.json       v2 清单：capabilities / network / cards（messageRenderers 为退路）
 ├── index.js            defineApp(async sdk => …)  官方 @hana/app-sdk 入口
 ├── sdk/                官方 SDK dist（77 个 .js，随 app 分发，不装 npm 包）
 ├── engine/
 │   ├── server.js       受管下载引擎：HTTP 面 + 卡片绑定表
+│   ├── engine-port.js  引擎端口唯一来源（index.js 与 server.js 共用）
 │   ├── dlcore.js       下载内核（HTTP 下载 / 断点续传 / git / pnpm / winget / pip 四条命令链路）
+│   ├── download-probe.js    winget 下载进度探测（看下载目录里的文件增长）
+│   ├── tunnel-agent.js      HTTP CONNECT 隧道代理
 │   └── progress-parsers.js  输出解析（git / pnpm / winget / pip / uv + winget 退出码表）
 ├── ui/
 │   ├── card.html / card.js        聊天流进度卡
 │   ├── manager.html / manager.js  跨会话管理器
+│   ├── shared/display.js          阶段/单位文案与任务形态判定的唯一来源（Node 侧也用）
 │   ├── card.css / manager.css     视觉素材
 │   ├── assets/sdk.js              官方 UI SDK（dist/ui.js）
 │   └── face.png                   卡片内联图标位图
+├── tests/                         离线测试与本地下载源（见 tests/README.md）
 ├── assets/icon.png | icon.svg
 └── docs/
-    ├── 重构说明.md                 本次重构的动因、实测结论、新架构
-    ├── 踩坑记录.md                 16 条，含四条宿主侧通用结论
-    ├── 七象限测试报告-20260914.md  最新：宿主 0.978.0 / 宽度 450，7/7 完成
+    ├── 改动生效范围.md            改哪些文件要不要重启（交付前先过这张表）
+    ├── 重构说明.md                 重构动因、实测结论、新架构
+    ├── 踩坑记录.md                 33 条，含宿主侧通用结论
+    ├── 规划-winget与pip-20260918.md
+    ├── 七象限测试报告-20260914.md  宿主 0.978.0 / 宽度 450，7/7 完成
     ├── 七象限测试报告-20260910.md  历史：宿主 0.946.2 / 宽度 550
     ├── 宿主缺陷-v2应用卡片投影丢工具名.md
     └── hana-app卡片尺寸与身份反馈.md
@@ -211,14 +217,36 @@ hana-downloader-app/
 
 ## 十、测试
 
-七象限投递能力测试（完成 / 取消 / 卡滞 × 未收束 / 已收束 + 卡滞恢复），
-最新一轮：宿主 0.978.0、宽度 450、**7/7 完成**，见 `docs/七象限测试报告-20260914.md`。
+离线测试住在仓库里，一条命令跑完（不依赖网络、宿主与引擎）：
 
-可复现的测试源（本地 HTTP，用于造完成/慢速/卡滞/恢复四类现场）：
+```powershell
+cd D:\HanakoWorks\HanaAgentAPPs\hana-downloader-app
+node tests/run-tests.mjs
+```
 
-```
-D:\HanakoWorks\_temp\fast-server.mjs              18932  6MB 一次性
-D:\HanakoWorks\_temp\slow-server.mjs              18933  6MB @ 80KB/s
-D:\HanakoWorks\_temp\stall-server.mjs             47653  1KB 后静默 150s
-D:\HanakoWorks\_temp\stall-recover-server-v5.mjs  18951  50MB，50% 停 35s，等 POST /trigger-resume
-```
+覆盖：输出解析器 46 项、winget 下载探测 10 项、展示层单一来源 32 项、
+下载内核端到端 17 项（含 SHA-256 校验与限速两条路）。明细与新增约定见 `tests/README.md`。
+
+七象限投递能力测试（完成 / 取消 / 卡滞 × 未收束 / 已收束 + 卡滞恢复）需要宿主在场，
+最新一轮：宿主 0.978.0、**7/7 完成**，见 `docs/七象限测试报告-20260914.md`
+（那一轮的卡片宽度还是 450；2026-09-17 起收窄为 400，见第九节）。
+
+造现场用的本地下载源也在仓库里：`tests/servers/`（2MB 快源 / 6MB 一次性 / 6MB 慢速 /
+卡滞 / 卡滞恢复），端口表见 `tests/README.md`。
+
+---
+
+## 十一、排障入口
+
+症状 → 先看哪里：
+
+| 症状 | 先查 |
+| --- | --- |
+| 卡片不出来 / 出来了但认错任务 | 第七节（出卡通道与卡片身份）、`docs/踩坑记录.md` 第 6、10、13 条 |
+| 工具调用报 `RPC peer closed` | 只 reload 没重启宿主，见第五节与第 14 条 |
+| 工具调用报 `engine fetch failed` | 引擎进程没了：看宿主日志里的 `[hd]` 行；watchdog 每 30s 探活并自动重启 |
+| 下载不动 / 卡在某个百分比 | `download-wait <taskId>` 看阶段；卡滞会落盘到 `{appDataDir}/stalled/` |
+| 命令失败但错误文案没信息量 | 第 32 条（失败摘要要抓带错误码的那行） |
+| winget / pip 下不动或装不上 | 第 33 条（各 CLI 的代理行为实测表）、第 25 条 |
+| 改了代码没生效 | `docs/改动生效范围.md`：哪类文件要重启，先过那张表 |
+| 同步后校验报大批差异 | 行尾漂移：看仓库根 `.gitattributes` 与第 21 条 |

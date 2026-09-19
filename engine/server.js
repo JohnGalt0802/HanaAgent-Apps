@@ -1,12 +1,11 @@
 // hana-downloader-app/engine/server.js — 受管下载引擎（完整版）
 // 复用插件时代的下载内核 lib/dlcore.js（纯 Node，无宿主依赖），对外提供 HTTP 服务：
 //   GET  /ping                        健康检查
-//   POST /download                    发起 URL 下载 { url, fileName?, saveDir?, speedLimit?, stallTimeoutMs?, sessionPath? }
+//   POST /download                    发起 URL 下载 { url, fileName?, saveDir?, speedLimit?, expectedSha256?, stallTimeoutMs?, sessionPath? }
 //   POST /command                     发起命令型下载 { kind: "git-clone"|"pnpm-install", repo?, targetDir?, workdir?, label? }
 //   GET  /wait?taskId=xxx             进度快照
 //   POST /cancel  { taskId, source? } 取消
 //   GET  /list                        全部任务
-//   GET  /events                      终态/停滞事件流（SSE）
 // 由 app 经 ctx.runtime.fetch(runtimeId, path) 访问，服务注册见 manifest 的 service 参数。
 import http from "node:http";
 import fs from "node:fs";
@@ -14,8 +13,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { getTaskManager, resolveWingetBin } from "./dlcore.js";
 import { parseWingetSearch } from "./progress-parsers.js";
+import { ENGINE_PORT } from "./engine-port.js";
 
-const PORT = Number(process.env.HD_ENGINE_PORT || 4317);
+// 端口来源唯一：engine-port.js（index.js 与引擎共用一个常量）。
+// HD_ENGINE_PORT 只作本机调试覆盖；默认值不再在这里重复写一个数字。
+const PORT = Number(process.env.HD_ENGINE_PORT || ENGINE_PORT);
 const READY_MARKER = "HD_ENGINE_READY";
 // dataDir 由 app 经 args 传入（受管程序的 cwd 不保证指向 app 数据目录）
 const DATA_DIR = process.argv[2] || process.env.HD_ENGINE_DATA_DIR || process.cwd();
@@ -60,14 +62,9 @@ function saveBind(db) {
   } catch (e) { log(`saveBind ERR ${e?.message || e}`); }
 }
 
-// ── 事件流（SSE）──
-const clients = new Set();
-function broadcast(obj) {
-  const line = `data: ${JSON.stringify(obj)}\n\n`;
-  for (const res of [...clients]) {
-    try { res.write(line); } catch { clients.delete(res); }
-  }
-}
+// ── 事件落盘（终态 / 停滞）──
+// app 侧不吃 RPC：轮询会产生持续挂起的连接，把工具回程前的 drain() 堵死。
+// 所以引擎把事件写成文件，app 用 fs 轮询。
 const summarize = (t) => t ? ({
   taskId: t.taskId, state: t.state || t.status, fileName: t.fileName, url: t.url,
   total: t.total ?? null, received: t.received ?? 0, filePath: t.filePath || null,
@@ -77,8 +74,7 @@ const summarize = (t) => t ? ({
 
 try { mgr.onFinal((t) => {
     log(`final ${t?.taskId} ${t?.state}`);
-    broadcast({ type: "final", task: summarize(t) });
-    // 同时落一个结果文件：app 侧用 fs 轮询它（不走 RPC，避免堵住工具回程的 rpc2.drain()）
+    // 落一个结果文件：app 侧用 fs 轮询它（不走 RPC，避免堵住工具回程的 rpc2.drain()）
     try {
       const dir = path.join(DATA_DIR, "finished");
       fs.mkdirSync(dir, { recursive: true });
@@ -87,7 +83,6 @@ try { mgr.onFinal((t) => {
   }); } catch (e) { log(`onFinal ERR ${e?.message || e}`); }
 try { mgr.onStall((t) => {
   log(`stall ${t?.taskId}`);
-  broadcast({ type: "stall", task: summarize(t) });
   // 与 finished 同一机制：落盘让 app 侧用 fs 轮询到（不占 RPC，不堵工具回包）
   try {
     const dir = path.join(DATA_DIR, "stalled");
@@ -239,6 +234,8 @@ const server = http.createServer(async (req, res) => {
         fileName: b.fileName || undefined,
         saveDir: b.saveDir || cfgSaveDir || undefined,
         speedLimit: b.speedLimit || undefined,
+        // 期望摘要：统一小写后交给内核比对（内核算出来的是小写 hex）
+        expectedSha256: b.expectedSha256 ? String(b.expectedSha256).trim().toLowerCase() : undefined,
         stallTimeoutMs: b.stallTimeoutMs || cfg.stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
         kind: "url",
@@ -410,15 +407,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 注意：不能使用 /download/* 前缀（“download” 会被宿主的运行时路由当成保留段，路径被截断）。
-  if (req.method === "GET" && u.pathname === "/events") {
-    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
-    res.write(`: connected\n\n`);
-    clients.add(res);
-    const ping = setInterval(() => { try { res.write(`: ping\n\n`); } catch {} }, 25000);
-    req.on("close", () => { clearInterval(ping); clients.delete(res); });
-    return;
-  }
-
   return send(404, { error: "not found", path: u.pathname });
 });
 

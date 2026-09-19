@@ -10,6 +10,8 @@
 // 视觉层（配色板、类结构、图标、文案、折叠联动）沿用旧版，未改。
 
 import { hana } from "./assets/sdk.js";
+// 阶段文案、计数单位与任务形态判定都有唯一来源（Node 侧 index.js 同用这个模块）
+import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask } from "./shared/display.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -216,15 +218,7 @@ function toggleAll() {
 // ── 渲染 ──
 var currentTask = null;
 
-var STAGE_TEXT = {
-  receiving: "接收中", checkout: "检出中", fetching: "拉取中", linking: "链接中",
-  building: "编译中", "resolving-deps": "解析依赖", cloning: "准备克隆",
-  enumerating: "枚举对象", resolving: "解析增量", finalizing: "收尾",
-  // winget / pip 链路（2026-09-18）
-  found: "查找包", downloading: "下载中", verifying: "校验哈希", installing: "安装中",
-  collecting: "解析依赖",
-};
-var UNIT_NAME = { objects: "对象", files: "文件", packages: "包" };
+// 阶段文案与计数单位来自 ui/shared/display.js（唯一来源），这里不再各存一份。
 
 function esc(s) {
   return String(s == null ? "" : s)
@@ -261,17 +255,16 @@ function render(t) {
   const done = state === "done";
   const terminal = done || state === "failed" || state === "canceled" || state === "interrupted";
   // winget / pip 是阶段式任务：输出里没有百分比与字节数据，数字区按需收起（2026-09-18）
-  const pkgTask = t.cmdType === "winget-install" || t.cmdType === "pip-install"
-    || !!(t.cmd && (t.cmd.type === "winget-install" || t.cmd.type === "pip-install"));
+  const pkgTask = isPkgTask(t);
   const pct = t.percent;
   const known = t.total != null && t.total > 0;
   // 计数型单位（objects / packages / files）在 total 未知时不报 100%：分母本来就不存在（2026-09-19）
   const pctText = done
-    ? (known || !(t.unit && t.unit !== "bytes") ? "100%" : "—")
+    ? (known || !isCountTask(t) ? "100%" : "—")
     : (known ? (pct == null ? "0" : pct.toFixed(pct >= 100 ? 0 : 1)) + "%" : "—");
   const unit = t.unit;
-  const sizeText = pending ? "—" : (unit && unit !== "bytes")
-    ? (t.received != null ? t.received : 0) + (known ? "/" + t.total : "") + (UNIT_NAME[unit] ? " " + UNIT_NAME[unit] : "")
+  const sizeText = pending ? "—" : isCountTask(t)
+    ? (t.received != null ? t.received : 0) + (known ? "/" + t.total : "") + unitSuffix(unit)
     : (done && known ? fmtBytes(t.total) : fmtBytes(t.received) + (known ? "/" + fmtBytes(t.total) : ""));
   const speedText = running && t.speed > 0 ? fmtBytes(t.speed) + "/s" : "";
 
@@ -357,14 +350,15 @@ function render(t) {
   html += '<div class="dl-d-row"><span class="dl-d-label">操作</span><span class="dl-d-value">'
     + '<button class="dl-btn dl-copy" id="dl-copy">复制路径</button></span></div>';
   if (known) {
-    let sizeDetail = (unit && unit !== "bytes")
-      ? t.total + (UNIT_NAME[unit] ? " " + UNIT_NAME[unit] : "")
+    const count = isCountTask(t);
+    let sizeDetail = count
+      ? t.total + unitSuffix(unit)
       : fmtBytes(t.total);
     if (running && t.received != null) {
-      sizeDetail += (unit && unit !== "bytes" ? "（已完成 " + t.received + "）" : "（已下载 " + fmtBytes(t.received) + "）");
+      sizeDetail += (count ? "（已完成 " + t.received + "）" : "（已下载 " + fmtBytes(t.received) + "）");
     }
     // 计数型（packages/objects/files）的“大小”其实是计数，标签跟着改（2026-09-19）
-    html += '<div class="dl-d-row"><span class="dl-d-label">' + (unit && unit !== "bytes" ? "数量" : "大小") + '</span><span class="dl-d-value">' + esc(sizeDetail) + "</span></div>";
+    html += '<div class="dl-d-row"><span class="dl-d-label">' + (count ? "数量" : "大小") + '</span><span class="dl-d-value">' + esc(sizeDetail) + "</span></div>";
   }
   html += '<div class="dl-d-row"><span class="dl-d-label">任务</span><span class="dl-d-value">' + esc(t.taskId || taskId) + "</span></div>";
   html += '<div class="dl-d-row"><span class="dl-d-label">状态</span><span class="dl-d-value">' + esc(badge) + (metaText ? "（" + esc(metaText) + "）" : "") + "</span></div>";

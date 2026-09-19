@@ -13,16 +13,13 @@ import { startWingetProbe } from "./download-probe.js";
 import { createTunnelAgent } from "./tunnel-agent.js";
 
 const TASKS_FILE = "tasks.json";
-const SPEED_CACHE_FILE = "speed-cache.json";
-const SPEED_CACHE_MAX = 50;    // 历史速度缓存条目上限
-const SPEED_CACHE_KEEP = 5;    // 每域名保留最近样本数
 const MAX_TASKS = 64;
 const SPEED_SAMPLE_MS = 700;   // 测速采样间隔
 const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
 const CHUNK_SLEEP_MIN_MS = 1;  // 限速时 chunk 间最小等待
 
 let _instance = null;
-const MGR_VER = 21; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除）
+const MGR_VER = 22; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码：prepare/startPending/onceFinal/mark*/速度缓存）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -54,80 +51,12 @@ class TaskManager {
     this.tasks = new Map();
     this._finalCb = null;
     this._stallCb = null;
-    this._speedCache = null; // 惰性加载
   }
 
-  // ── 历史下载速度缓存（按域名；供 wait auto 模式估算阈值，本地计算不费模型算力）──
-  _loadSpeedCache() {
-    if (this._speedCache) return this._speedCache;
-    try {
-      this._speedCache = JSON.parse(fs.readFileSync(path.join(this.dataDir, SPEED_CACHE_FILE), "utf-8"));
-    } catch { this._speedCache = {}; }
-    return this._speedCache;
-  }
-
-  _saveSpeedCache() {
-    try {
-      fs.mkdirSync(this.dataDir, { recursive: true });
-      fs.writeFileSync(path.join(this.dataDir, SPEED_CACHE_FILE), JSON.stringify(this._speedCache), "utf-8");
-    } catch { /* 缓存写入失败不影响下载 */ }
-  }
-
-  recordSpeed(host, speed) {
-    if (!host || !Number.isFinite(speed) || speed <= 0) return;
-    const cache = this._loadSpeedCache();
-    const list = cache[host] || (cache[host] = []);
-    list.push({ speed: Math.round(speed), at: Date.now() });
-    if (list.length > SPEED_CACHE_KEEP) list.splice(0, list.length - SPEED_CACHE_KEEP);
-    // 整体条目数上限：清最老的域名
-    const hosts = Object.keys(cache);
-    if (hosts.length > SPEED_CACHE_MAX) {
-      hosts.sort((a, b) => (cache[a][cache[a].length - 1]?.at || 0) - (cache[b][cache[b].length - 1]?.at || 0));
-      for (const h of hosts.slice(0, hosts.length - SPEED_CACHE_MAX)) delete cache[h];
-    }
-    this._saveSpeedCache();
-  }
-
-  getHostSpeed(host) {
-    const list = this._loadSpeedCache()[host];
-    if (!list || !list.length) return null;
-    const avg = list.reduce((a, s) => a + s.speed, 0) / list.length;
-    return avg > 0 ? avg : null;
-  }
-
-  // v0.6.6 起主逻辑不再订阅 onFinal，终态投递由扩展 dl-nextturn 负责；保留此 API 仅供扩展或第三方接入使用。
-  // 注册终态回调（done/failed/canceled），供插件层做 deferred 通知
+  // 注册终态回调（done/failed/canceled）：server.js 用它把终态与停滞落盘到 finished/ 与 stalled/。
   onFinal(cb) { this._finalCb = typeof cb === "function" ? cb : null; }
 
-  // 终态一次性等待：终态到达（或已是终态）时立即 resolve。
-  // 供 download-wait 实现「取消/完成即时唤醒」，不再等轮询间隔。
-  // 返回 { promise, cancel }：cancel 用于 wait 每轮循环退出时清理 waiter，防止无界累积。
-  onceFinal(taskId) {
-    let wrapped = null;
-    let set = null;
-    const promise = new Promise((resolve) => {
-      const t = this.tasks.get(taskId);
-      if (t && (t.state === "done" || t.state === "failed" || t.state === "canceled" || t.state === "interrupted")) { resolve(t); return; }
-      if (!this._finalWaiters) this._finalWaiters = new Map();
-      set = this._finalWaiters.get(taskId);
-      if (!set) { set = new Set(); this._finalWaiters.set(taskId, set); }
-      wrapped = (task) => { set.delete(wrapped); resolve(task); };
-      set.add(wrapped);
-    });
-    return {
-      promise,
-      cancel() {
-        if (wrapped && set) { set.delete(wrapped); wrapped = null; }
-      },
-    };
-  }
-
   _fireFinal(task) {
-    // 唤醒挂起的 onceFinal waiter（立即返回，不等轮询）
-    try {
-      const set = this._finalWaiters && task ? this._finalWaiters.get(task.taskId) : null;
-      if (set && set.size) { this._finalWaiters.delete(task.taskId); for (const fn of [...set]) { try { fn(task); } catch { /* 忽略单个 waiter 异常 */ } } }
-    } catch { /* 唤醒异常不影响通知 */ }
     if (!this._finalCb || !task) return;
     const s = task.state;
     if (s === "done" || s === "failed" || s === "canceled" || s === "interrupted") {
@@ -168,62 +97,6 @@ class TaskManager {
     return task;
   }
 
-  // ── 准备任务（pending）：先占位，延迟后自动启动，保证卡片从 0% 开始渲染 ──
-  prepare({ url, fileName, saveDir, speedLimit, startDelayMs, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind = "url", cmd = null, unit = "bytes", filePath, resumable = true, expectedSha256 = null }) {
-    const task = this._createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, state: "pending", stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256 });
-    // 严格解析延迟：只有有限正数才走延迟路径，其余（0/undefined/非法）立即启动
-    const raw = Number(startDelayMs);
-    const delay = Number.isFinite(raw) && raw > 0 ? raw : 0;
-    if (delay > 0) {
-      task.pendingTimer = setTimeout(() => {
-        this.startPending(task.taskId);
-      }, delay);
-      if (task.pendingTimer?.unref) task.pendingTimer.unref();
-    } else {
-      // 立即启动；若同步启动失败，标记失败，避免任务永久卡在 pending（无 timer、无 controller）
-      try {
-        this.startPending(task.taskId);
-      } catch (e) {
-        task.state = "failed";
-        task.error = friendlyError(e);
-        task.finishedAt = Date.now();
-        this._persist();
-        // 不在 catch 调 _fireFinal：交给外层 _run() 的 finally 块统一触发（避免错误路径 fireFinal
-        // 覆盖 _run 后续成功路径——之前 fireFinal 误触发了两次，injectForSession 第一次消费的
-        // entry.content 是错误路径的 status="failed"，第二次成功路径因 alreadyHandled skip，
-        // 导致 agent 看到 status="failed" 但实际 task 成功 + 文件落盘）。
-      }
-    }
-    return task;
-  }
-
-  // 查询任务（供 deferred 延迟复查等）：返回任务对象引用（只读使用）
-  getTask(taskId) {
-    return this.tasks.get(taskId) || null;
-  }
-
-  // 标记任务已投递成功（持久化到 tasks.json，host 重启后 onload 兜底可读到、不再二次 resolve）。
-  // dl-nextturn followUp/同步投递成功后调用：置 t.delivered=true + 落盘。
-  markDelivered(taskId) {
-    const t = this.tasks.get(taskId);
-    if (!t) return false;
-    t.delivered = true;
-    this._persist();
-    return true;
-  }
-
-  // 启动 pending 任务
-  startPending(taskId) {
-    const t = this.tasks.get(taskId);
-    if (!t || t.state !== "pending") return { ok: false, error: "任务不存在或不在准备中" };
-    t.state = "running";
-    t.startedAt = Date.now();
-    t.controller = new AbortController();
-    this._persist();
-    this._run(t);
-    return { ok: true };
-  }
-
   _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, state, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null }) {
     if (this.tasks.size >= MAX_TASKS) {
       // 清理最老的已结束任务
@@ -261,9 +134,6 @@ class TaskManager {
       cancelRequested: false,
       sessionId: sessionId || null,
       sessionRef: sessionRef || null,
-      consumedByWait: false, // wait 返回终态时置真：标识 Agent 已拿到结果（投递时供识别冗余）
-      waitActive: 0, // wait 正在守望的计数：onFinal 时 >0 说明 Agent 即将通过 wait 拿到结果
-      waitBudgetExhausted: false, // 守望预算已用尽：后续 wait 对该任务直接快照，禁止二次守望（杜绝回查循环）
       speedLimit: Number.isFinite(speedLimit) && speedLimit > 0 ? speedLimit : 0,
       controller: state === "pending" ? null : new AbortController(),
       pendingTimer: null,
@@ -595,12 +465,6 @@ class TaskManager {
       try { controller.signal.removeEventListener("abort", abortListener); } catch { /* 忽略 */ }
       this._stopStallMonitor(task);
       task.elapsed = (task.finishedAt || Date.now()) - (task.startedAt || Date.now());
-      // 记录历史速度（按域名），供 wait auto 模式估算阈值
-      if (task.total && task.total > 0 && task.elapsed > 0) {
-        const host = hostOf(task.url);
-        const avg = (task.received / task.elapsed) * 1000;
-        if (host) this.recordSpeed(host, avg);
-      }
       task.speed = 0;
       this._persist();
       this._fireFinal(task);
@@ -859,44 +723,9 @@ class TaskManager {
       note: t.note || null,
       sessionId: t.sessionId || null,
       sessionPath: t.sessionPath || null,
-      consumedByWait: t.consumedByWait === true,
-      deferredRegistered: t.deferredRegistered === true,
-      waitActive: t.waitActive || 0,
-      waitBudgetExhausted: t.waitBudgetExhausted === true,
       saveDir: t.saveDir || null,
       speedLimit: t.speedLimit || 0,
     };
-  }
-
-  // wait 拿到终态后调用：标记 Agent 已消费结果（deferred 投递时 result.consumedByWait=true）。
-  // 同时取消终态投递的延迟复查定时器（v0.5.7）：Agent 已拿到终态，投递不再需要，立即止血。
-  markConsumedByWait(taskId) {
-    const t = this.tasks.get(taskId);
-    if (t && !t.consumedByWait) {
-      t.consumedByWait = true;
-      if (t._resolveTimer) { try { clearTimeout(t._resolveTimer); } catch { /* 忽略 */ } t._resolveTimer = null; }
-      this._persist();
-    }
-  }
-
-  // wait 进入/退出守望的计数：onFinal 判断 Agent 是否即将通过 wait 拿到结果（时序无关）
-  markWaitActive(taskId) {
-    const t = this.tasks.get(taskId);
-    if (t) t.waitActive = (t.waitActive || 0) + 1;
-  }
-
-  markWaitInactive(taskId) {
-    const t = this.tasks.get(taskId);
-    if (t && t.waitActive > 0) t.waitActive -= 1;
-  }
-
-  // 守望预算到点（未终态）后调用：标记该任务禁止二次守望，后续 wait 直接快照
-  markWaitBudgetExhausted(taskId) {
-    const t = this.tasks.get(taskId);
-    if (t && !t.waitBudgetExhausted) {
-      t.waitBudgetExhausted = true;
-      this._persist();
-    }
   }
 
   // ── 全部任务快照（跨会话下载管理器用）：在途优先，终态按结束时间倒序 ──
@@ -1016,8 +845,6 @@ class TaskManager {
           error: isCmd ? "命令被中断（应用重启），请重新执行" : "下载被中断（应用重启），请重新发起下载",
           cancelRequested: false, speedLimit: m.speedLimit || 0,
           sessionId: m.sessionId || null, sessionPath: m.sessionPath || null, sessionRef: null, controller: null, pendingTimer: null, _samples: [],
-          consumedByWait: m.consumedByWait === true, deferredRegistered: m.deferredRegistered === true,
-          delivered: m.delivered === true,
           stalledAt: m.stalledAt || null, stallNotified: false, _lastProgressAt: now,
           kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null, note: m.note || null,
           partPath: partPath || "",
@@ -1040,8 +867,6 @@ class TaskManager {
             speed: 0, startedAt: m.startedAt || now, finishedAt: m.finishedAt || now,
             elapsed: m.elapsed || 0, error: m.error || null, cancelRequested: false, speedLimit: m.speedLimit || 0,
             sessionId: m.sessionId || null, sessionPath: m.sessionPath || null, sessionRef: null, controller: null, pendingTimer: null, _samples: [],
-            consumedByWait: m.consumedByWait === true, deferredRegistered: m.deferredRegistered === true,
-            delivered: m.delivered === true,
             stalledAt: m.stalledAt || null, stallNotified: false, _lastProgressAt: now,
             kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null, note: m.note || null,
             partPath: m.partPath || (m.filePath ? m.filePath + ".part" : null),
@@ -1087,9 +912,6 @@ class TaskManager {
           stalledAt: t.stalledAt || null,
           sessionId: t.sessionId || null,
           sessionPath: t.sessionPath || null,
-          consumedByWait: t.consumedByWait === true,
-          deferredRegistered: t.deferredRegistered === true,
-          delivered: t.delivered === true,
           etag: t.etag || null,
           lastModified: t.lastModified || null,
           partPath: t.partPath || null,
@@ -1105,10 +927,6 @@ class TaskManager {
 }
 
 // ── 辅助函数 ──
-
-function hostOf(url) {
-  try { return new URL(url).host; } catch { return null; }
-}
 
 // 命令输出缓冲：追加文本并截断到 4KB，供失败时错误摘要（最后几行）
 function appendBuf(buf, text) {
