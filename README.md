@@ -261,7 +261,7 @@ node tests/run-tests.mjs
 | 卡片不出来 / 出来了但认错任务 | 第七节（出卡通道与卡片身份）、`docs/踩坑记录.md` 第 6、10、13 条 |
 | 工具调用报 `RPC peer closed` | 只 reload 没重启宿主，见第五节与第 14 条 |
 | 工具调用报 `engine fetch failed` | 引擎进程没了：看宿主日志里的 `[hd]` 行；watchdog 每 30s 探活并自动重启 |
-| 下载不动 / 卡在某个百分比 | `download-wait <taskId>` 看阶段；卡滞会落盘到 `{appDataDir}/stalled/` |
+| 下载不动 / 卡在某个百分比 | `download-wait <taskId>` 看阶段；卡滞会落盘到 `{appDataDir}/stalled/`，并且 App 会把它投回原会话（日志 `notify sent (download-stall)`） |
 | 任务显示「排队中」一直不动 | 到了「同时下载上限」：在管理器齿轮里调大或设 0（不限），或等前面的任务结束 |
 | 点了重试但 agent 没反应 | 看 App 日志里的 `retry notify`：任务没带会话路径时不会通知（手动造的任务就是这种） |
 | 命令失败但错误文案没信息量 | 第 32 条（失败摘要要抓带错误码的那行） |

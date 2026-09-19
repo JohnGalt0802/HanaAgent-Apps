@@ -255,6 +255,11 @@ export default defineApp(async (sdk) => {
   //
   // 所以「按会话路径投递」只能在 App 换成 sessionId。工具 execute 期间有会话上下文，
   // 就在这里查一次并随任务存下去，后续所有通知（卡滞 / 重试）都靠它。
+  //
+  // 两个宿主约束（读 0.1013.2 bundle 的 session:list handler 得到）：
+  //   · 必须传 scope: "all"，否则只列本 App 自己的会话（用户的会话不在里面，永远匹配不到）
+  //   · scope:"all" 会校验能力 app/sessions.read（“read sessions outside this app”），
+  //     清单里必须声明它，光有 app/sessions.manage 不够
   // 进程内缓存：同一个会话的后续调用直接命中，不必反复拉列表。
   const sessionIdCache = new Map();
   async function resolveSessionId(sessionPath) {
@@ -262,7 +267,7 @@ export default defineApp(async (sdk) => {
     if (sessionIdCache.has(sessionPath)) return sessionIdCache.get(sessionPath);
     let id = null;
     try {
-      const r = await sdk.sessions.list({});
+      const r = await sdk.sessions.list({ scope: "all" });
       const arr = Array.isArray(r) ? r : (r?.sessions || r?.items || r?.list || []);
       const hit = (Array.isArray(arr) ? arr : []).find((s) => s && (s.path === sessionPath || s.sessionPath === sessionPath));
       id = hit?.sessionId || hit?.id || null;

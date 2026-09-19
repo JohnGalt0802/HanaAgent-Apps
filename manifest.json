@@ -26,6 +26,7 @@
     "app/tasks.manage",
     "app/session.start-turn",
     "app/sessions.manage",
+    "app/sessions.read",
     "app/tools.expose-to-model",
     "app/resources.read",
     "app/ui.clipboard-write",
