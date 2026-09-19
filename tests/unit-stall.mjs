@@ -71,6 +71,7 @@ const api = async (p, body) => {
 // ── 造一个 1 秒就判卡滞的任务，sessionPath 是伪造的（只验落盘契约，不验投递）──
 let taskId = null;
 try {
+  const t0 = Date.now();
   const r = await api("/download", {
     url: `http://127.0.0.1:${SRC_PORT}/stall.bin`,
     fileName: "stall-probe.bin",
@@ -89,6 +90,10 @@ try {
     try { if (fs.existsSync(stalledFile)) snap = JSON.parse(fs.readFileSync(stalledFile, "utf8")); } catch { /* 半写，下一轮 */ }
   }
   check("卡滞快照落盘", !!snap, (x) => x === true);
+  // 「第一时间」：判定间隔曾等于阈值，第一次检查总是差一点，实际要等第二次（实测 30s 阈值→60s）。
+  // 这里用 1s 阈值钉住：落盘不该晚于 2.5 秒。
+  const judgeMs = Date.now() - t0;
+  check("**判定要快**（1s 阈值下 2.5s 内落盘）", judgeMs, (x) => x < 2500);
   check("快照 state 仍是 running（中途快照，不是终态）", snap, (x) => x?.state === "running");
   check("**快照带 sessionPath**（App 靠它决定投到哪个会话）", snap, (x) => x?.sessionPath === FAKE_SESSION);
   check("快照带 stalledAt（App 靠它去重）", snap, (x) => typeof x?.stalledAt === "number" && x.stalledAt > 0);

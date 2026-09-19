@@ -349,7 +349,10 @@ export default defineApp(async (sdk) => {
   //
   // 去重：key = taskId#stalledAt。同一个任务两次卡滞是两件事（中间恢复过），各自通知一次。
   // 启动时先静默扫一遍：stalled/ 里的存量都是历史卡滞，回放只会重复叫醒。
-  const STALL_WATCH_MS = 3000;
+  // 1 秒扫一次：卡滞通知的意义就在「第一时间」，3 秒的轮询会让「即时」打折。
+  // 开销是一次 readdir + 至多几个小 JSON，可忽略。
+  // 与引擎侧的判定间隔（同样 1 秒级）叠起来，从「真的卡住」到「agent 被叫醒」最坏约 2 秒。
+  const STALL_WATCH_MS = 1000;
   const notifiedStalls = new Set();
   let stallTimer = null;
 

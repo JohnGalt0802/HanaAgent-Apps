@@ -272,7 +272,9 @@ class TaskManager {
     // 人为限速（speedLimit>0）的任务不报停滞：throttle 主动 pause 流的间歇不是网络异常，
     // 误判会在低速率下必性触发假 stall 通知（v0.13.1，9-08 实测 250B/s 任务 1s 即报）。
     if (task.speedLimit > 0) return;
-    const interval = Math.max(500, Math.min(5000, Math.floor((task.stallTimeoutMs || 30000) / 4)));
+    // 「第一时间」要求：判定延迟最多一秒（取 1/4 阈值与 1 秒的较小者，下限 500ms）。
+    // 卡滞是「要 agent 决策」的事件，晚一分钟通知等于没通知。
+    const interval = Math.max(500, Math.min(1000, Math.floor((task.stallTimeoutMs || 30000) / 4)));
     task._stallTimer = setInterval(() => {
       try {
         if (task.state !== "running") return;
