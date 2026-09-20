@@ -311,16 +311,20 @@ export default defineApp(async (sdk) => {
     if (!stallTaskId) return;
     if (consumedStallTasks.has(stallTaskId)) { consumedStallTasks.delete(stallTaskId); return; }
     try {
-      // 收尾优先用 remove：它只移除记录、不向会话投递。
-      // cancel 会把一条 "canceled" 当成结果投给模型，每次没卡滞的下载都白得一条噪音。
-      // remove 不在公开文档里，运行时探一下，没有就退回 cancel。
-      if (typeof sdk.tasks?.remove === "function") {
-        await sdk.tasks.remove(stallTaskId);
-        log(`stall-task removed (unused, silent) | ${stallTaskId}`);
-      } else {
-        await sdk.tasks.cancel(stallTaskId);
-        log(`stall-task closed (unused, via cancel) | ${stallTaskId}`);
+      // 收尾要「静默」：cancel 会把一条 "canceled" 当成结果投给模型，
+      // 每次没卡滞的下载都白得一条噪音（实测）。
+      // sdk.tasks 的 22 个成员里没有 remove（启动时打印过成员名），先试 abort，不行退回 cancel。
+      if (typeof sdk.tasks?.abort === "function") {
+        try {
+          await sdk.tasks.abort(stallTaskId, "未使用，静默收尾");
+          log(`stall-task aborted (unused) | ${stallTaskId}`);
+          return;
+        } catch (e2) {
+          log(`stall-task abort failed, fallback to cancel | ${e2?.message || e2}`);
+        }
       }
+      await sdk.tasks.cancel(stallTaskId);
+      log(`stall-task closed (unused, via cancel) | ${stallTaskId}`);
     }
     catch (e) { err(`stall-task close ERR | ${stallTaskId} | ${e?.message || e}`); }
   }
