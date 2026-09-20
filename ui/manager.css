@@ -435,3 +435,43 @@ html, body {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
   z-index: 100;
 }
+
+/* ── 数值型设置行（2026-09-20）──
+   标签 + 数字输入框 + 单位，替代原来的 window.prompt
+   （App 卡片跑在宿主 iframe 里，prompt 被屏蔽，点了没反应） */
+.mgr-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+}
+.mgr-settings-row:hover { background: var(--mgr-hover, rgba(0, 0, 0, 0.03)); }
+.mgr-settings-label {
+  flex: 1 1 auto;
+  font-size: 12px;
+  color: var(--mgr-text, #3B3D3F);
+  white-space: nowrap;
+}
+.mgr-settings-input {
+  width: 76px;
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  font-size: 12px;
+  text-align: right;
+  color: var(--mgr-text, #3B3D3F);
+  background: var(--mgr-bg, #FFFFFF);
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.14));
+  border-radius: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.mgr-settings-input:focus {
+  outline: none;
+  border-color: var(--mgr-accent, #4A6CF7);
+}
+.mgr-settings-unit {
+  width: 40px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--mgr-muted, #6B6F73);
+  white-space: nowrap;
+}

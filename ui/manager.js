@@ -621,57 +621,76 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
         .catch(function () { hint("设置失败：网络错误"); });
     };
 
-    var opt3 = el("button", "mgr-settings-opt", "停滞判定阈值（当前：" + (settings.stallTimeoutMs || 30000) + " ms）");
-    opt3.title = "下载无新数据超过该时长判定为停滞（卡片显示 stalled 徐标）";
-    opt3.onclick = function (e) {
-      e.stopPropagation(); // 防止外部点击监听误关菜单
-      var cur = settings.stallTimeoutMs || 30000;
-      var v = window.prompt("停滞判定阈值（毫秒）", String(cur));
-      if (v == null) return;
-      var n = parseInt(v, 10);
-      if (!isFinite(n) || n <= 0) { hint("请输入大于 0 的毫秒数"); return; }
-      apiFetch("/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ stallTimeoutMs: n }),
-      })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-          if (data.ok) { settings = data.settings; renderSettingsOptions(menu); closeSettingsMenu(); hint("已设置停滞阈值 " + n + " ms"); }
-          else hint("设置失败：" + (data.error || "未知错误"));
-        })
-        .catch(function () { hint("设置失败：网络错误"); });
-    };
-
-    // 限速与并发（2026-09-20）：引擎侧早就支持，这里补上入口
-    var opt4 = el("button", "mgr-settings-opt", "默认限速（" + fmtLimit(settings.speedLimit) + "）");
-    opt4.title = "任务自己没有单独限速时用这个值；0 表示不限速";
-    opt4.onclick = function (e) {
-      e.stopPropagation();
-      var cur = settings.speedLimit > 0 ? String(Math.round(settings.speedLimit / 1024)) : "0";
-      var v = window.prompt("默认限速（KB/s，0 = 不限速）", cur);
-      if (v == null) return;
-      var kb = parseFloat(v);
-      if (!isFinite(kb) || kb < 0) { hint("请输入不小于 0 的数字（KB/s）"); return; }
-      saveSetting({ speedLimit: Math.round(kb * 1024) }, menu, kb > 0 ? "已设置默认限速 " + Math.round(kb) + " KB/s" : "已取消默认限速");
-    };
-
-    var opt5 = el("button", "mgr-settings-opt", "同时下载上限（" + (settings.maxConcurrent > 0 ? settings.maxConcurrent + " 个" : "不限") + "）");
-    opt5.title = "同时处于下载中的任务数；超出的排到队列里等待；0 表示不限";
-    opt5.onclick = function (e) {
-      e.stopPropagation();
-      var v = window.prompt("同时下载上限（0 = 不限）", String(settings.maxConcurrent > 0 ? settings.maxConcurrent : 0));
-      if (v == null) return;
-      var n = parseInt(v, 10);
-      if (!isFinite(n) || n < 0) { hint("请输入不小于 0 的整数"); return; }
-      saveSetting({ maxConcurrent: n }, menu, n > 0 ? "已设置同时下载上限 " + n + " 个" : "已取消并发限制");
-    };
+    // 数值型设置：内嵌输入框（App 卡片跑在宿主的 iframe 里，window.prompt 被屏蔽，点了没反应）
+    // 0 一律表示「不限」：限速 0 = 不限速，并发 0 = 不限个数
+    var opt3 = numberRow({
+      label: "停滞判定阈值", unit: "ms", value: settings.stallTimeoutMs || 30000, min: 1000, step: 1000,
+      title: "下载无新数据超过该时长就判定为停滞",
+      save: function (v) { patchSettings({ stallTimeoutMs: v }, "已设置停滞阈值 " + v + " ms"); },
+    });
+    var opt4 = numberRow({
+      label: "默认限速", unit: "KB/s", value: settings.speedLimit > 0 ? Math.round(settings.speedLimit / 1024) : 0, min: 0, step: 64,
+      title: "任务自己没有单独限速时用这个值；0 表示不限速",
+      save: function (v) { patchSettings({ speedLimit: Math.round(v * 1024) }, v > 0 ? "已设置默认限速 " + v + " KB/s" : "已取消默认限速"); },
+    });
+    var opt5 = numberRow({
+      label: "同时下载上限", unit: "个", value: settings.maxConcurrent > 0 ? settings.maxConcurrent : 0, min: 0, step: 1,
+      title: "同时处于下载中的任务数；超出的排队等待；0 表示不限",
+      save: function (v) { patchSettings({ maxConcurrent: v }, v > 0 ? "已设置同时下载上限 " + v + " 个" : "已取消并发限制"); },
+    });
 
     menu.appendChild(opt1);
     menu.appendChild(opt2);
     menu.appendChild(opt3);
     menu.appendChild(opt4);
     menu.appendChild(opt5);
+  }
+
+  // 数值型设置行：标签 + 数字输入框 + 单位，回车或失焦即保存。
+  // 不用 window.prompt 的原因：App 卡片跑在宿主的 iframe 里，prompt 被屏蔽，点了毫无反应
+  //（2026-09-20 用户实测反馈「这三个点了没有效果」）。
+  function numberRow(cfg) {
+    var row = el("div", "mgr-settings-row");
+    if (cfg.title) row.title = cfg.title;
+    var min = cfg.min != null ? cfg.min : 0;
+    var label = el("span", "mgr-settings-label", cfg.label);
+    var input = document.createElement("input");
+    input.type = "number";
+    input.className = "mgr-settings-input";
+    input.value = String(cfg.value);
+    input.min = String(min);
+    if (cfg.step != null) input.step = String(cfg.step);
+    var unit = el("span", "mgr-settings-unit", cfg.unit || "");
+    var commit = function () {
+      var v = parseInt(input.value, 10);
+      if (!isFinite(v) || v < min) { hint("请输入不小于 " + min + " 的整数"); input.value = String(cfg.value); return; }
+      if (v === cfg.value) return;
+      cfg.save(v);
+    };
+    input.onkeydown = function (e) { if (e.key === "Enter") { e.stopPropagation(); commit(); } };
+    input.onblur = commit;
+    // 阻止冒泡：菜单外有 document 级点击监听，不拦会把菜单关掉
+    input.onclick = function (e) { e.stopPropagation(); };
+    input.onmousedown = function (e) { e.stopPropagation(); };
+    row.appendChild(label);
+    row.appendChild(input);
+    row.appendChild(unit);
+    return row;
+  }
+
+  // 只提交设置，不重绘也不关菜单：数值项改完还能接着改别的
+  function patchSettings(patch, okText) {
+    apiFetch("/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data && data.ok) { settings = data.settings || settings; hint(okText || "已保存"); }
+        else hint("设置失败：" + ((data && data.error) || "未知错误"));
+      })
+      .catch(function () { hint("设置失败：网络错误"); });
   }
 
   // 设置项的统一保存路径：写引擎设置 → 刷新本地快照 → 重绘菜单
