@@ -177,7 +177,7 @@ export default defineApp(async (sdk) => {
   // ── 终态结算 ────────────────────────────────────────────────────
   // 引擎把终态写成 dataDir/finished/<taskId>.json，这里读文件而不是轮询引擎：
   // 轮询会产生持续的挂起 RPC，把工具回程前的 drain() 堵死。
-  async function settleWhenDone(engineTaskId, hostTaskId, label) {
+  async function settleWhenDone(engineTaskId, hostTaskId, label, stallTaskId = null) {
     const fs = await import("node:fs");
     const path = await import("node:path");
     const finishedPath = path.join(dataDir, "finished", `${engineTaskId}.json`);
@@ -205,6 +205,7 @@ export default defineApp(async (sdk) => {
 
     if (!snap) {
       try { await sdk.tasks.fail(hostTaskId, "下载超时未结束"); } catch { /* 宿主任务可能已结束 */ }
+      await closeUnusedStallTask(stallTaskId);
       return;
     }
 
@@ -244,6 +245,8 @@ export default defineApp(async (sdk) => {
     } catch (e) {
       err(`tasks settle ERR | ${hostTaskId} | ${e?.message || e}`);
     }
+    // 下载结束了：卡滞提醒任务没用上就取消掉
+    await closeUnusedStallTask(stallTaskId);
   }
 
   // ── sessionPath → sessionId 解析（2026-09-20）────────────────
@@ -277,6 +280,38 @@ export default defineApp(async (sdk) => {
     if (id) { sessionIdCache.set(sessionPath, id); log(`sessionId resolved | ${id}`); }
     else log(`sessionId unresolved | ${sessionPath}`);
     return id;
+  }
+
+  // ── 卡滞通知任务（2026-09-20 按 APPS.md 的投递档位重做）──────────
+  // 为什么要单独弄一个甴主任务：卡滞发生在工具 execute 结束之后，那时令牌已失效，
+  // 而「能拼进下一次 API 调用」的投递（delivery: "next-step"）只在创建任务时固定。
+  // 所以令牌还在的时候先把任务建好，卡滞时后台只结算 taskId。
+  // APPS.md 原文：next-step「不打断在途模型请求...正在运行（包括等待工具）的会话会在下一次输入收集点
+  // 接收结果，空闲会话则启动后续回合」——正是要的行为。前提 minAppVersion >= 0.931.0，
+  // 能力 app/tasks.manage + app/session.start-turn（清单里都有）。
+  async function createStallTask(callToken, label) {
+    if (!callToken) return null;
+    try {
+      const st = await sdk.tasks.create({ callToken, label: `停滞提醒：${label}`, delivery: "next-step" });
+      const id = st?.taskId || null;
+      log(`stall-task created | ${id} | ${label}`);
+      return id;
+    } catch (e) {
+      err(`stall-task create ERR | ${e?.message || e}`);
+      return null;
+    }
+  }
+
+  // 已经被卡滞提醒消费掉的甴主任务：下载终态时不再重复结算（否则要么投递一条废消息，要么一直挂着）
+  const consumedStallTasks = new Set();
+
+  // 下载结束时收尾：卡滞提醒任务没用上就取消掉
+  // （挂着的 pending app-task 会挡住短定时，踩坑第 17 条）
+  async function closeUnusedStallTask(stallTaskId) {
+    if (!stallTaskId) return;
+    if (consumedStallTasks.has(stallTaskId)) { consumedStallTasks.delete(stallTaskId); return; }
+    try { await sdk.tasks.cancel(stallTaskId); log(`stall-task closed (unused) | ${stallTaskId}`); }
+    catch (e) { err(`stall-task close ERR | ${stallTaskId} | ${e?.message || e}`); }
   }
 
   // ── 往原会话投一条隐藏记录（2026-09-20）──────────────────────
@@ -393,6 +428,19 @@ export default defineApp(async (sdk) => {
         `可选动作：继续等（对端可能自己恢复）；取消（download-cancel ${snap.taskId}）；或者先放着。`,
         `（这条记录是当时写下的，你读到它时可能已经过时；先用 download-wait ${snap.taskId} 确认当前状态再动手。）`,
       ].filter(Boolean);
+      // 正路：宿主任务 + next-step 投递（能拼进下一次 API 调用，见 APPS.md 的投递档位）
+      const stId = snap.stallTaskId || null;
+      if (stId) {
+        try {
+          await sdk.tasks.complete(stId, { text: lines.join("\n") });
+          consumedStallTasks.add(stId);
+          log(`stall notify sent (next-step) | ${stId}`);
+        } catch (e) {
+          err(`stall notify ERR (next-step) | ${e?.message || e}`);
+        }
+        continue;
+      }
+      // 兜底：没有卡滞任务（老任务、或非工具发起）时退回自定义消息
       await notifySession({ sessionId: sid, sessionPath: sp }, lines.join("\n"), "download-stall");
     }
   }
@@ -451,20 +499,24 @@ export default defineApp(async (sdk) => {
         const sessionPath = context?.sessionPath;
         // 会话身份要在 execute 期间锁下来（晚了就没有上下文了，而卡滞/重试的通知都得靠它）
         const sessionId = await resolveSessionId(sessionPath);
-        log(`download-file invoked | url=${url} callToken=${typeof callToken} sessionPath=${sessionPath || "?"} sessionId=${sessionId || "-"}`);
+        // 卡滞提醒用独立甴主任务（next-step 投递）：令牌只在 execute 期间有效，先建好
+        const stallTaskId = await createStallTask(callToken, fileName || url);
+        log(`download-file invoked | url=${url} callToken=${typeof callToken} sessionPath=${sessionPath || "?"} sessionId=${sessionId || "-"} stallTask=${stallTaskId || "-"}`);
 
         let r;
         try {
           r = await callEngine("/download", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ url, fileName, saveDir, speedLimit, expectedSha256, callToken, sessionPath, sessionId, messageId: context?.messageId || null }),
+            body: JSON.stringify({ url, fileName, saveDir, speedLimit, expectedSha256, callToken, sessionPath, sessionId, stallTaskId, messageId: context?.messageId || null }),
           });
         } catch (e) {
           err(`engine call ERR | ${e?.message || e}`);
+          await closeUnusedStallTask(stallTaskId);
           return { content: [{ type: "text", text: `发起下载失败：${e?.message || e}` }], isError: true };
         }
         if (r?.error || !r?.taskId) {
+          await closeUnusedStallTask(stallTaskId);
           return { content: [{ type: "text", text: `发起下载失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
 
@@ -478,7 +530,7 @@ export default defineApp(async (sdk) => {
             log(`tasks.create OK | ${JSON.stringify(task)}`);
             if (task?.taskId) {
               setTimeout(() => {
-                settleWhenDone(r.taskId, task.taskId, displayName)
+                settleWhenDone(r.taskId, task.taskId, displayName, stallTaskId)
                   .catch((e) => err(`settle ERR | ${e?.message || e}`));
               }, 200);
             }
@@ -651,6 +703,7 @@ export default defineApp(async (sdk) => {
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
         const sessionId = await resolveSessionId(sessionPath);
+        const stallTaskId = await createStallTask(callToken, label || pkg || kind);
         log(`download-command invoked | kind=${kind} callToken=${typeof callToken} sessionId=${sessionId || "-"}`);
 
         let r;
@@ -658,18 +711,21 @@ export default defineApp(async (sdk) => {
           r = await callEngine("/command", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, sessionPath, sessionId, messageId: context?.messageId || null }),
+            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, sessionPath, sessionId, stallTaskId, messageId: context?.messageId || null }),
           });
         } catch (e) {
+          await closeUnusedStallTask(stallTaskId);
           return { content: [{ type: "text", text: `发起失败：${e?.message || e}` }], isError: true };
         }
         // winget 多候选：未创建任务，把候选列表交给调用者选定后以完整 ID 重调
         if (r?.multiple) {
           const lines = (r.candidates || []).map((x, i) => `${i + 1}. ${x.name} — ${x.id}${x.version ? `（${x.version}）` : ""}`);
           const text = [`「${r.query || pkg}」匹配到多个包，请选定后以完整 ID 重新调用（kind="winget-install", pkg="<ID>"）：`, ...lines].join("\n");
+          await closeUnusedStallTask(stallTaskId);
           return { content: [{ type: "text", text }] };
         }
         if (r?.error || !r?.taskId) {
+          await closeUnusedStallTask(stallTaskId);
           return { content: [{ type: "text", text: `发起失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
 
@@ -689,7 +745,7 @@ export default defineApp(async (sdk) => {
             log(`tasks.create OK | ${JSON.stringify(task)}`);
             if (task?.taskId) {
               setTimeout(() => {
-                settleWhenDone(r.taskId, task.taskId, displayName)
+                settleWhenDone(r.taskId, task.taskId, displayName, stallTaskId)
                   .catch((e) => err(`settle ERR | ${e?.message || e}`));
               }, 200);
             }

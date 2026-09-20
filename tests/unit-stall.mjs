@@ -77,6 +77,7 @@ try {
     fileName: "stall-probe.bin",
     saveDir: path.join(BASE, "out"),
     sessionPath: FAKE_SESSION,
+    stallTaskId: "app:hana-downloader:fake-stall-task",
     stallTimeoutMs: 1000,   // 1 秒无数据即判卡滞，测试不必等 30 秒
   });
   taskId = r?.taskId || null;
@@ -96,6 +97,7 @@ try {
   check("**判定要快**（1s 阈值下 2.5s 内落盘）", judgeMs, (x) => x < 2500);
   check("快照 state 仍是 running（中途快照，不是终态）", snap, (x) => x?.state === "running");
   check("**快照带 sessionPath**（App 靠它决定投到哪个会话）", snap, (x) => x?.sessionPath === FAKE_SESSION);
+  check("**快照带 stallTaskId**（App 靠它走 next-step 投递）", snap, (x) => x?.stallTaskId === "app:hana-downloader:fake-stall-task");
   check("快照带 stalledAt（App 靠它去重）", snap, (x) => typeof x?.stalledAt === "number" && x.stalledAt > 0);
   check("快照带 taskId/fileName", snap, (x) => x?.taskId === taskId && x?.fileName === "stall-probe.bin");
 

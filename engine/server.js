@@ -78,6 +78,7 @@ const summarize = (t) => t ? ({
   error: t.error || null, canceledBy: t.canceledBy || null,
   cmdType: t.cmd?.type || null, note: t.note || null,
   sessionPath: t.sessionPath || null, sessionId: t.sessionId || null,
+  stallTaskId: t.stallTaskId || null,
   stalledAt: t.stalledAt || null,
 }) : null;
 
@@ -249,6 +250,7 @@ const server = http.createServer(async (req, res) => {
         stallTimeoutMs: b.stallTimeoutMs || cfg.stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
         sessionId: b.sessionId || null,
+        stallTaskId: b.stallTaskId || null,
         kind: "url",
       });
       log(`created ${t?.taskId} | ${b.url}`);
@@ -341,6 +343,7 @@ const server = http.createServer(async (req, res) => {
         stallTimeoutMs: b.stallTimeoutMs || loadCfg().stallTimeoutMs || undefined,
         sessionPath: b.sessionPath || null,
         sessionId: b.sessionId || null,
+        stallTaskId: b.stallTaskId || null,
       });
       log(`created command ${t?.taskId} | ${kind} ${fileName}`);
       return send(200, { ok: true, taskId: t?.taskId, state: t?.state || t?.status, kind: "command", fileName, filePath: filePath || null });

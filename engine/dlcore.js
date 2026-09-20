@@ -97,8 +97,8 @@ class TaskManager {
   }
 
   // ── 创建任务（可能排队，见 applyConfig）──
-  create({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind = "url", cmd = null, unit = "bytes", filePath, resumable = true, expectedSha256 = null }) {
-    const task = this._createTask({ url, fileName, saveDir, speedLimit: speedLimit || this._defaultSpeedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256 });
+  create({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind = "url", cmd = null, unit = "bytes", filePath, resumable = true, expectedSha256 = null, stallTaskId = null }) {
+    const task = this._createTask({ url, fileName, saveDir, speedLimit: speedLimit || this._defaultSpeedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256, stallTaskId });
     this._enqueueOrStart(task);
     return task;
   }
@@ -196,7 +196,7 @@ class TaskManager {
     return { ok: true, taskId: t.taskId, state: t.state, queued: t.queued === true };
   }
 
-  _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null }) {
+  _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null, stallTaskId = null }) {
     if (this.tasks.size >= MAX_TASKS) {
       // 清理最老的已结束任务
       for (const [id, t] of this.tasks) {
@@ -244,6 +244,8 @@ class TaskManager {
       _lastProgressAt: Date.now(),
       stallTimeoutMs: Number.isFinite(stallTimeoutMs) && stallTimeoutMs > 0 ? stallTimeoutMs : 30000,
       sessionPath: sessionPath || null,
+      // 卡滞提醒用的甴主任务 id（app 侧创建、随任务存下，卡滞时由 app 结算它）
+      stallTaskId: stallTaskId || null,
       kind,
       cmd,
       unit,
