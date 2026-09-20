@@ -473,8 +473,15 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     ];
     // 终态全集（供“全部”清空）
     var FINAL_ALL = ["done", "failed", "canceled", "interrupted"];
+    // 各分类的条数：2026-09-20 起数字标在标签里（工具栏那行「N 完成 · N 异常」删掉了）
+    var tally = {
+      all: tasks.length,
+      active: tasks.filter(function (t) { return t.state === "running" || t.state === "pending"; }).length,
+      done: tasks.filter(function (t) { return t.state === "done"; }).length,
+      failed: tasks.filter(function (t) { return t.state === "failed" || t.state === "canceled" || t.state === "interrupted"; }).length,
+    };
     items.forEach(function (it) {
-      var b = el("button", "mgr-filter" + (filter === it[0] ? " active" : ""), it[0] === "all" ? it[1] + " (" + tasks.length + ")" : it[1]);
+      var b = el("button", "mgr-filter" + (filter === it[0] ? " active" : ""), it[1] + " (" + tally[it[0]] + ")");
       b.onclick = function () { filter = it[0]; expanded = null; renderFilterBar(); render(); };
       // 双击弹出下拉：不同分类给不同操作（在途→全部取消；其余→清空记录）
       b.ondblclick = function (e) {
@@ -808,34 +815,17 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     timer = setInterval(poll, POLL_MS);
   }
 
-  // ── 顶部计数 ──
-  function renderCounts() {
-    var c = document.getElementById("mgr-counts");
-    if (!c) return;
-    var running = tasks.filter(function (t) { return t.state === "running"; }).length;
-    var done = tasks.filter(function (t) { return t.state === "done"; }).length;
-    var failed = tasks.filter(function (t) { return t.state === "failed" || t.state === "canceled" || t.state === "interrupted"; }).length;
-    c.innerHTML = "";
-    var bits = [];
-    if (running) bits.push('<span class="cnt-running">' + running + ' 下载中</span>');
-    bits.push('<span class="cnt-done">' + done + ' 完成</span>');
-    if (failed) bits.push('<span class="cnt-failed">' + failed + ' 异常</span>');
-    c.innerHTML = bits.join(" · ");
-  }
-
   // ── 初始化 ──
   function init() {
-    // 顶部工具条：设置按钮 + 搜索框 + 计数器
+    // 顶部工具条：搜索框 + 齿轮（计数已移到下方分类标签里）
     var toolbar = el("div", "mgr-toolbar");
     var settingsWrap = el("div", "mgr-settings");
     settingsWrap.id = "mgr-settings";
     var searchWrap = el("div", "mgr-search");
     searchWrap.id = "mgr-search";
-    var counts = el("div", "mgr-counts");
-    counts.id = "mgr-counts";
-    // 齿轮放最右（右上角）：搜索与计数在左，设置靠右
+    // 齿轮放最右（右上角）：搜索在左，设置靠右
+    // （原来的「N 完成 · N 异常」计数已删，数字改标在下方分类标签里）
     toolbar.appendChild(searchWrap);
-    toolbar.appendChild(counts);
     toolbar.appendChild(settingsWrap);
 
     var filters = el("div", "mgr-filters");
@@ -855,7 +845,6 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     var origRender = render;
     render = function () {
       origRender();
-      renderCounts();
       var cb = document.querySelector(".mgr-search-clear");
       if (cb) cb.classList.toggle("show", !!search);
     };
