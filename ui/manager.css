@@ -457,12 +457,19 @@ html, body {
   flex: 0 0 auto;
   padding: 3px 6px;
   font-size: 12px;
-  text-align: right;
+  text-align: left;
   color: var(--mgr-text, #3B3D3F);
   background: var(--mgr-bg, #FFFFFF);
   border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.14));
   border-radius: 6px;
   font-variant-numeric: tabular-nums;
+  -moz-appearance: textfield; /* Firefox：不要数字框的上下箭头 */
+}
+/* Chromium：隐藏 number 输入的上下调箭头 */
+.mgr-settings-input::-webkit-outer-spin-button,
+.mgr-settings-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 .mgr-settings-input:focus {
   outline: none;
