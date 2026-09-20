@@ -310,7 +310,18 @@ export default defineApp(async (sdk) => {
   async function closeUnusedStallTask(stallTaskId) {
     if (!stallTaskId) return;
     if (consumedStallTasks.has(stallTaskId)) { consumedStallTasks.delete(stallTaskId); return; }
-    try { await sdk.tasks.cancel(stallTaskId); log(`stall-task closed (unused) | ${stallTaskId}`); }
+    try {
+      // 收尾优先用 remove：它只移除记录、不向会话投递。
+      // cancel 会把一条 "canceled" 当成结果投给模型，每次没卡滞的下载都白得一条噪音。
+      // remove 不在公开文档里，运行时探一下，没有就退回 cancel。
+      if (typeof sdk.tasks?.remove === "function") {
+        await sdk.tasks.remove(stallTaskId);
+        log(`stall-task removed (unused, silent) | ${stallTaskId}`);
+      } else {
+        await sdk.tasks.cancel(stallTaskId);
+        log(`stall-task closed (unused, via cancel) | ${stallTaskId}`);
+      }
+    }
     catch (e) { err(`stall-task close ERR | ${stallTaskId} | ${e?.message || e}`); }
   }
 
@@ -920,5 +931,6 @@ export default defineApp(async (sdk) => {
     }
   })();
 
+  try { log(`sdk.tasks members | ${Object.keys(sdk.tasks || {}).join(",")}`); } catch { /* 探测失败无妨 */ }
   log("apply done");
 });
