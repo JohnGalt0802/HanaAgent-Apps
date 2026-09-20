@@ -105,6 +105,7 @@ html, body {
 .mgr-settings {
   position: relative;
   flex-shrink: 0;
+  margin-left: auto; /* 齿轮推到工具栏最右（右上角） */
 }
 .mgr-settings-btn {
   width: 30px;
@@ -124,7 +125,7 @@ html, body {
 .mgr-settings-menu {
   position: absolute;
   top: 36px;
-  left: 0;
+  right: 0; /* 齿轮在最右，菜单向左展开 */
   z-index: 50;
   min-width: 260px;
   background: var(--mgr-bg, #FFFFFF);

@@ -518,15 +518,15 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     wrap.appendChild(box);
   }
 
-  // 设置菜单：文件夹图标 + 两个选项（设置默认下载地址 / 助手选择下载地址）
+  // 设置菜单：右上角齿轮，点开是下载地址 / 默认限速 / 同时下载上限 / 停滞阈值
   function renderSettingsMenu() {
     var wrap = document.getElementById("mgr-settings");
     if (!wrap) return;
     wrap.innerHTML = "";
     var btn = el("button", "mgr-settings-btn");
-    btn.title = "下载地址设置";
-    // 内联 SVG：文件夹线性图标（stroke currentColor，跟随主题）
-    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>';
+    btn.title = "设置";
+    // 内联 SVG：齿轮线性图标（stroke currentColor，跟随主题）
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
     btn.onclick = function (e) {
       e.stopPropagation();
       var open = wrap.classList.toggle("open");
@@ -833,9 +833,10 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     searchWrap.id = "mgr-search";
     var counts = el("div", "mgr-counts");
     counts.id = "mgr-counts";
-    toolbar.appendChild(settingsWrap);
+    // 齿轮放最右（右上角）：搜索与计数在左，设置靠右
     toolbar.appendChild(searchWrap);
     toolbar.appendChild(counts);
+    toolbar.appendChild(settingsWrap);
 
     var filters = el("div", "mgr-filters");
     filters.id = "mgr-filters";
