@@ -368,6 +368,25 @@ export default defineApp(async (sdk) => {
     }
   }
 
+  // 重试一被受理就先告诉 agent（2026-09-21）。这是「agent 感知不同步」的正面：
+  // 它此前收到的是这个任务的终态（失败/取消），用户点了重试之后它并不知道任务又跑起来了，
+  // 于是 agent、卡片、管理器三方各说各话。这里发一条轻量记录说清是重试发起
+  //（不是新的下载请求），跑完的结果另外再通知一次。
+  async function notifyRetryStarted(engineTaskId, sessionPath, label) {
+    try {
+      const name = label || engineTaskId;
+      const lines = [
+        `${RECORD_PREFIX}用户在下载管理器里点「重试」，该任务已重新开始（重试发起，不是新的下载请求）。`,
+        `任务：${name}`,
+        `任务 ID：${engineTaskId}`,
+        `跑完会再通知一次结果；想随时看进度可以用 download-wait 查这个 ID。`,
+      ];
+      await notifySession({ sessionPath }, lines.join("\n"), "retry-note");
+    } catch (e) {
+      err(`retry start notify ERR | ${e?.message || e}`);
+    }
+  }
+
   // 轮询 finished/<taskId>.json（与 settleWhenDone 同一机制：读文件，不占 RPC），
   // 终态时把结果投回原会话。引擎在 /retry 里已把上一轮的终态文件删掉，所以这里读到的必是这一次的。
   async function notifyWhenRetryDone(engineTaskId, sessionPath, label) {
@@ -868,6 +887,9 @@ export default defineApp(async (sdk) => {
         if (r?.ok && r?.taskId) {
           const sessionPath = r.sessionPath || body?.sessionPath || null;
           log(`retry accepted | ${r.taskId} | session=${sessionPath || "-"}`);
+          // 先报「已重新开始」，让 agent 的感知跟卡片、管理器对齐（2026-09-21）
+          notifyRetryStarted(r.taskId, sessionPath, r.fileName)
+            .catch((e) => err(`retry start notify ERR | ${e?.message || e}`));
           setTimeout(() => {
             notifyWhenRetryDone(r.taskId, sessionPath, r.fileName)
               .catch((e) => err(`retry notify ERR | ${e?.message || e}`));

@@ -29,6 +29,19 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
   syncTheme();
   try { hana.theme.subscribe(function () { syncTheme(); }); } catch (e3) { /* 订阅不可用就只留首帧 */ }
 
+  // ── 卡片联动通道 ──
+  // 2026-09-21：管理器和聊天流卡片各跑在独立 iframe 里，本来互不通气。管理器的「重试」
+  // 是在同一个 taskId 上把任务复活，而卡片进终态后已停止轮询，于是停在旧状态，
+  // 必须刷新前端才恢复（用户实测反馈）。现在凡是改任务状态的动作都广播一声，
+  // 卡片收到后立刻恢复快频轮询并马上查一次。
+  var BC = null;
+  try { BC = new BroadcastChannel("hana-dl-cards"); } catch (e5) { BC = null; }
+  function notifyCards(taskId) {
+    if (!BC) return;
+    // taskId 传 null 表示「不指定」，所有卡片都醒一下
+    try { BC.postMessage({ type: "taskChanged", taskId: taskId || null }); } catch (e6) { /* 忽略 */ }
+  }
+
   try { hana.ready(); } catch (e4) { /* ready 失败不阻塞渲染 */ }
 
   // ── 配色诊断（2026-09-14）──
@@ -445,7 +458,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
       .then(function (data) {
         // 诊断：后端返回 diag 时一并展示（hasClear 等），便于定位模块缓存问题
         var diag = data && data.diag ? "  [diag:" + (data.diag.hasClear ? "clear=YES" : "clear=NO") + "/" + (data.diag.hasCancelAll ? "cancelAll=YES" : "cancelAll=NO") + "]" : "";
-        if (data && data.ok) { hint("已清空 " + (data.removed ? data.removed.length : 0) + " 条记录"); poll(); }
+        if (data && data.ok) { hint("已清空 " + (data.removed ? data.removed.length : 0) + " 条记录"); notifyCards(null); poll(); }
         else { hint("清空失败：" + ((data && data.error) || "未知错误") + diag); }
       })
       .catch(function () { hint("清空失败：网络错误"); });
@@ -455,7 +468,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     apiFetch("/download/cancel-all", { method: "POST", cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        if (data && data.ok) { hint("已取消 " + (data.canceled ? data.canceled.length : 0) + " 个在途任务"); poll(); }
+        if (data && data.ok) { hint("已取消 " + (data.canceled ? data.canceled.length : 0) + " 个在途任务"); notifyCards(null); poll(); }
         else { hint("取消失败：" + ((data && data.error) || "未知错误")); }
       })
       .catch(function () { hint("取消失败：网络错误"); });
@@ -766,6 +779,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (!d || !d.ok) { hint((d && d.error) || "删除失败"); return; }
+        notifyCards(t && t.taskId);
         if (d.fileError) hint("记录已删除，文件删除失败：" + d.fileError);
         else if (d.fileSkipped) hint("已删除记录，" + d.fileSkipped);
         else hint(deleteFile ? "已删除记录及文件" : "已删除记录");
@@ -787,7 +801,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
   }
   function cancelTask(t) {
     apiFetch("/download/cancel?taskId=" + encodeURIComponent(t.taskId), { method: "POST", cache: "no-store" })
-      .then(function () { poll(); })
+      .then(function () { notifyCards(t && t.taskId); poll(); })
       .catch(function () {});
   }
   // 重试：走 App 的 /retry（不是引擎透传），App 会在受理后起一个终态守望，
@@ -802,6 +816,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
       .then(function (d) {
         if (!d || !d.ok) { hint((d && d.error) || "重试失败"); return; }
         hint(d.queued ? "已重新排队，等前面的任务结束" : "已重新开始");
+        notifyCards(t && t.taskId); // 叫醒对应卡片：它此前停在终态，已不再快频轮询
         poll();
       })
       .catch(function () { hint("重试失败：网络错误"); });

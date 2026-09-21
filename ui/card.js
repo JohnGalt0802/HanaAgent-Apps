@@ -117,27 +117,41 @@ async function engineFetch(path, body, method) {
 }
 
 // ── 状态机 ──
+// 2026-09-21：终态不再彻底停轮询。管理器的「重试」是在同一个 taskId 上把任务复活，
+// 卡片若已 stop() 就永远看不到新状态，必须刷新前端才恢复（用户实测反馈）。
+// 现在：活跃 300ms，终态后转 5s 慢查等复活；管理器改状态时会广播 taskChanged，
+// 卡片收到立刻恢复快频并马上查一次。
 var timer = null;
+var FAST_MS = 300;   // 活跃期（引擎侧数据源 500ms 更新一轮）
+var IDLE_MS = 5000;  // 终态后的慢查，只为等「重试」把任务唤起
 var FINAL_STATES = { done: 1, failed: 1, canceled: 1, interrupted: 1 };
+
+function schedule(ms) {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (!ms) return;
+  timer = setInterval(poll, ms);
+}
 
 async function poll() {
   try {
     const data = await engineFetch("wait", { taskId: taskId || null });
     if (!data || !data.ok) {
       renderFail((data && data.error) || "任务不存在");
-      stop();
+      schedule(IDLE_MS);
       return;
     }
     const t = data.task || data.snap;
     if (t && t.taskId) taskId = t.taskId;
     render(t);
-    if (FINAL_STATES[t.state]) stop();
+    // 终态转慢查（任务可能被管理器重试复活），非终态保持快频
+    schedule(FINAL_STATES[t.state] ? IDLE_MS : FAST_MS);
   } catch (e) {
-    // 瞬时错误（引擎重启/网络抖动）：静默重试
+    // 瞬时错误（引擎重启/网络抖动）：保持节奏，别把轮询丢掉
+    schedule(FAST_MS);
   }
 }
 
-function stop() { if (timer) { clearInterval(timer); timer = null; } }
+function stop() { schedule(null); }
 
 async function cancel() {
   try {
@@ -189,10 +203,21 @@ try { BC = new BroadcastChannel("hana-dl-cards"); } catch (e) { BC = null; }
 if (BC) {
   BC.onmessage = (ev) => {
     const d = ev.data;
-    if (!d || d.type !== "setAll") return;
-    allExpanded = !!d.value;
-    expanded = allExpanded;
-    applyExpandState();
+    if (!d || !d.type) return;
+    // 折叠联动：卡片之间同步「展开全部」
+    if (d.type === "setAll") {
+      allExpanded = !!d.value;
+      expanded = allExpanded;
+      applyExpandState();
+      return;
+    }
+    // 2026-09-21：管理器改了任务状态（重试 / 取消 / 删除 / 改设置），
+    // 立刻恢复快频并马上查一次，不必等前端刷新。
+    if (d.type === "taskChanged") {
+      if (d.taskId && taskId && d.taskId !== taskId) return; // 不是本卡的任务，忽略
+      schedule(FAST_MS);
+      poll();
+    }
   };
 }
 
@@ -434,8 +459,5 @@ setTimeout(() => {
 
 (async () => {
   await bindTask();
-  await poll();
-  // 300ms 一轮（2026-09-18 调快，原 600ms）：数据源 500ms 更新一次，
-  // 再快的收益有限但开销极小（内存快照读取），以跟手为准。
-  timer = setInterval(poll, 300);
+  await poll(); // poll 内部按任务状态排好后续节奏，这里不再另起 setInterval
 })();
