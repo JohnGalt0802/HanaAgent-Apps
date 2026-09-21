@@ -136,8 +136,10 @@ async function poll() {
   try {
     const data = await engineFetch("wait", { taskId: taskId || null });
     if (!data || !data.ok) {
+      // 任务真的不存在（被删除，或引擎重启后没这条记录）：停掉轮询。
+      // 注意与「终态」区别：终态要留着慢查等重试，任务没了就没得等了。
       renderFail((data && data.error) || "任务不存在");
-      schedule(IDLE_MS);
+      stop();
       return;
     }
     const t = data.task || data.snap;
