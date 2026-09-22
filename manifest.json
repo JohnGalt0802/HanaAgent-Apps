@@ -51,6 +51,7 @@
         "description": "单个下载任务的实时进度卡片",
         "route": "/card.html",
         "cardForm": "flush",
+        "pageOf": "manager",
         "face": {
           "image": "face.png"
         }
