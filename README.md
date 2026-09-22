@@ -128,7 +128,7 @@ bindings.json     卡片绑定表：pending（待认领）/ bind（cardInstanceI
 
 ```
 hana-downloader-app/
-├── manifest.json       v2 清单：capabilities / network / cards（messageRenderers 为退路）
+├── manifest.json       v2 清单：capabilities / network / cards
 ├── index.js            defineApp(async sdk => …)  官方 @hana/app-sdk 入口
 ├── sdk/                官方 SDK dist（77 个 .js，随 app 分发，不装 npm 包）
 ├── engine/
@@ -184,11 +184,16 @@ hana-downloader-app/
 写进 `details.card.cardInstanceId`。宿主原样采用（实测：重启前后、实时与历史投影四处一致），
 卡片加载后报出它就能直接查到任务，不依赖加载顺序推断。
 
-### 备选通道（补丁也不可用时）
+### 备选通道（已移除，留档）
 
-可退回 `session:send-custom` + `contributes.messageRenderers`。代价：流式中的投递只能排成
-`followUp`，卡片要等本回合结束才出现，而且那条消息会进模型上下文。
-清单里的 `messageRenderers` 声明保留着，随时可切回。
+如果将来 `details.card` 这条路在某个宿主版本失效，可以退回 `session:send-custom` +
+`contributes.messageRenderers`。代价：流式中的投递只能排成 `followUp`，卡片要等本回合结束
+才出现，而且那条消息会进模型上下文。
+
+2026-09-21 起清单里的 `messageRenderers` 声明**已移除**，连同为它准备的那张 `progress` 卡。
+原因：卡片中心会把 `contributes.cards` 全量列出，而那张卡的存在只为退路，对用户是多出来的一格（
+《踩坑记录》第 39 条）。要切回退路，需同时恢复 `cards` 里的 `progress` 声明与
+`messageRenderers` 段落，然后重装。
 ## 八、已知限制
 
 1. **历史遗留卡可能抢新任务**：若池子里只剩一条新任务，而某张没有 pending 记录的旧卡先加载，
