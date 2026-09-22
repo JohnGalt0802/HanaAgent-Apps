@@ -116,6 +116,15 @@ async function engineFetch(path, body, method) {
   return res.json();
 }
 
+// App 自己的路由（不走 /engine/* 透传）。目前用于 /retry：该路由由 App 处理，
+// 因为 App 受理后要起一个终态守望，好在跑完后把结果通知回原会话。
+async function appFetch(path, body) {
+  const init = { method: "POST", headers: { "content-type": "application/json" } };
+  if (body) init.body = JSON.stringify(body);
+  const res = await hana.api.fetch(path, init);
+  return res.json();
+}
+
 // ── 状态机 ──
 // 2026-09-21：终态不再彻底停轮询。管理器的「重试」是在同一个 taskId 上把任务复活，
 // 卡片若已 stop() 就永远看不到新状态，必须刷新前端才恢复（用户实测反馈）。
@@ -144,6 +153,8 @@ async function poll() {
     }
     const t = data.task || data.snap;
     if (t && t.taskId) taskId = t.taskId;
+    // 重试等待的收尾：状态翻身（或等到超时）就停止转圈，交给紧随其后的 render 画对
+    if (retrying && (!FINAL_STATES[t.state] || Date.now() > retryDeadline)) retrying = false;
     render(t);
     // 终态转慢查（任务可能被管理器重试复活），非终态保持快频
     schedule(FINAL_STATES[t.state] ? IDLE_MS : FAST_MS);
@@ -154,6 +165,36 @@ async function poll() {
 }
 
 function stop() { schedule(null); }
+
+// ── 卡片上的重试（圈箭头，2026-09-21）──
+// 只出现在终态（失败 / 取消 / 中断）。点一下箭头转圈，直到任务离开终态——
+// 转圈的停止交给 poll：状态一翻身，render 出来就没有这个按钮了。
+var retrying = false;      // 点过重试、正等状态翻身
+var retryDeadline = 0;     // 超过这个时刻就不再等（避免箭头无限转）
+const RETRY_WAIT_MS = 8000;
+
+async function retry() {
+  if (retrying) return;
+  retrying = true;
+  retryDeadline = Date.now() + RETRY_WAIT_MS;
+  render(currentTask); // 立刻画出转圈态
+  try {
+    const d = await appFetch("/retry", { taskId: taskId || null });
+    if (!d || !d.ok) {
+      retrying = false;
+      render(currentTask);
+      renderHint((d && d.error) || "重试失败");
+      return;
+    }
+    // 受理成功：转圈继续，等 poll 拿到非终态；顺带立刻查一次
+    schedule(FAST_MS);
+    poll();
+  } catch (e) {
+    retrying = false;
+    render(currentTask);
+    renderHint("重试失败：网络错误");
+  }
+}
 
 async function cancel() {
   try {
@@ -361,6 +402,15 @@ function render(t) {
       html += '<button class="dl-btn primary" id="dl-open">打开</button>'
         + '<button class="dl-btn" id="dl-folder" title="打开所在文件夹">文件夹</button>';
     }
+  } else if (FINAL_STATES[t.state]) {
+    // 终态（失败 / 取消 / 中断）给一个圈箭头重试（2026-09-21）。
+    // 箭头转圈 = 已提交，等它翻身；停止由 poll 驱动，状态一变这个分支就不再走。
+    html += '<button class="dl-btn ico retry' + (retrying ? " spinning" : "") + '" id="dl-retry"'
+      + ' title="' + (retrying ? "重试中…" : "重试下载") + '"'
+      + (retrying ? " disabled" : "")
+      + '><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M21 12a9 9 0 1 1-3.2-6.9"/><polyline points="21 4 21 10 15 10"/></svg>'
+      + "</button>";
   }
   html += "</div>";
 
@@ -412,6 +462,7 @@ function render(t) {
   on("dl-open", () => reveal("open"));
   on("dl-folder", () => reveal("select"));
   on("dl-copy", () => copyPath(filePath));
+  on("dl-retry", retry);
 }
 
 function renderFail(msg) {

@@ -158,6 +158,11 @@ body {
 }
 .dl-btn.ico.primary svg { stroke: #FFFFFF; }
 .dl-btn.ico.ok { color: var(--dl-green, #22C55E); }
+/* 卡片上的重试（圈箭头，2026-09-21）：点一下箭头转圈，直到任务离开终态。
+   转圈的意义就是「已提交、正在等它翻身」，停了就是没在等了。 */
+@keyframes dl-retry-spin { to { transform: rotate(360deg); } }
+.dl-btn.retry.spinning svg { animation: dl-retry-spin 0.9s linear infinite; }
+.dl-btn.retry[disabled] { opacity: 0.6; cursor: default; }
 
 /* ── 第二行：进度条（独占一行，拉满）──
    2026-09-17：数据组上移到信息行后，本行只剩条本身，给一点上边距避免贴成下划线 */
