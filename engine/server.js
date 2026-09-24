@@ -23,6 +23,10 @@ const READY_MARKER = "HD_ENGINE_READY";
 // dataDir 由 app 经 args 传入（受管程序的 cwd 不保证指向 app 数据目录）
 const DATA_DIR = process.argv[2] || process.env.HD_ENGINE_DATA_DIR || process.cwd();
 const CFG_FILE = path.join(DATA_DIR, "engine-config.json");
+// 用户配置（config.json）：目前只放 proxy（代理模式与自定义名单），由 dlcore.js 读取。
+// 与 engine-config.json 分开：前者是「运行行为」的开关（管理器设置菜单写），
+// 后者是「下载策略」的长期配置（可手工编辑，不至于被设置菜单覆盖掉）。
+const USER_CFG_FILE = path.join(DATA_DIR, "config.json");
 
 const log = (s) => { try { console.log(`[hd-engine] ${s}`); } catch {} };
 
@@ -30,6 +34,19 @@ const log = (s) => { try { console.log(`[hd-engine] ${s}`); } catch {} };
 // 由管理器的设置菜单经 POST /settings 写入，下载时作为缺省值生效。
 function loadCfg() {
   try { return JSON.parse(fs.readFileSync(CFG_FILE, "utf8")) || {}; } catch { return {}; }
+}
+
+function loadUserCfg() {
+  try { return JSON.parse(fs.readFileSync(USER_CFG_FILE, "utf8")) || {}; } catch { return {}; }
+}
+
+// 把 config.json 的 proxy 字段归一到三档给 UI 展示
+//   false → never；字符串 → always；对象 → 取其 mode；其它 → auto
+function normalizeProxyMode(p) {
+  if (p === false) return "never";
+  if (typeof p === "string" && p.trim()) return "always";
+  if (p && typeof p === "object" && ["auto", "always", "never"].includes(p.mode)) return p.mode;
+  return "auto";
 }
 
 const mgr = getTaskManager(DATA_DIR);
@@ -437,17 +454,35 @@ const server = http.createServer(async (req, res) => {
 
   if (u.pathname === "/settings") {
     if (req.method === "GET") {
-      return send(200, { ok: true, settings: loadCfg() });
+      // proxyMode 由 config.json 归一而来（dlcore.js 读的是那个文件，不是 engine-config.json）
+      const s = { ...loadCfg(), proxyMode: normalizeProxyMode(loadUserCfg().proxy) };
+      return send(200, { ok: true, settings: s });
     }
     if (req.method === "POST") {
       const b = await readBody();
       try {
-        const next = { ...loadCfg(), ...(b && typeof b === "object" ? b : {}) };
+        const body = (b && typeof b === "object") ? { ...b } : {};
+        // proxyMode 落到 config.json，其余字段照旧落到 engine-config.json
+        // （不把 proxyMode 混写进 engine-config.json，两个文件的职责别串）
+        if ("proxyMode" in body) {
+          const raw = body.proxyMode;
+          delete body.proxyMode;
+          const mode = ["auto", "always", "never"].includes(raw) ? raw : "auto";
+          const uc = loadUserCfg();
+          const prevUrl = typeof uc.proxy === "object" && uc.proxy && typeof uc.proxy.url === "string"
+            ? uc.proxy.url
+            : (typeof uc.proxy === "string" ? uc.proxy : "");
+          uc.proxy = mode === "never" ? false : { mode, url: prevUrl };
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+          fs.writeFileSync(USER_CFG_FILE, JSON.stringify(uc, null, 2), "utf8");
+          log(`proxyMode set | ${mode}`);
+        }
+        const next = { ...loadCfg(), ...body };
         fs.mkdirSync(DATA_DIR, { recursive: true });
         fs.writeFileSync(CFG_FILE, JSON.stringify(next, null, 2), "utf8");
         // 改设置即时生效：把新的并发上限与默认限速灌进任务管理器，不等下一次发起
         try { mgr.applyConfig(next); } catch (e2) { log(`applyConfig ERR ${e2?.message || e2}`); }
-        return send(200, { ok: true, settings: next });
+        return send(200, { ok: true, settings: { ...next, proxyMode: normalizeProxyMode(loadUserCfg().proxy) } });
       } catch (e) { return send(500, { error: String(e?.message || e) }); }
     }
   }

@@ -634,6 +634,34 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
         .catch(function () { hint("设置失败：网络错误"); });
     };
 
+    // 代理模式（2026-09-24）：一个按钮循环切换三档，写 config.json 的 proxy 字段。
+    // auto = 国内源直连、国外源走代理（默认，通常不需要改）；always = 全走代理；never = 全直连。
+    // 不关菜单，方便连续点着看效果。
+    var PROXY_LABEL = { auto: "自动（国内直连 / 国外代理）", always: "始终走代理", never: "始终直连" };
+    var PROXY_NEXT = { auto: "always", always: "never", never: "auto" };
+    var curProxyMode = settings.proxyMode || "auto";
+    var optProxy = el("button", "mgr-settings-opt active", "代理：" + PROXY_LABEL[curProxyMode]);
+    optProxy.title = "点击切换：自动 → 始终走代理 → 始终直连。自动模式下国外源走代理、国内源直连（不依赖白名单）。";
+    optProxy.onclick = function (e) {
+      e.stopPropagation(); // 防止外部点击监听误关菜单
+      var nextMode = PROXY_NEXT[curProxyMode] || "auto";
+      apiFetch("/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxyMode: nextMode }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.ok) {
+            settings = data.settings;
+            curProxyMode = settings.proxyMode || "auto";
+            optProxy.textContent = "代理：" + PROXY_LABEL[curProxyMode];
+            hint("已设置代理模式：" + PROXY_LABEL[curProxyMode]);
+          } else hint("设置失败：" + (data.error || "未知错误"));
+        })
+        .catch(function () { hint("设置失败：网络错误"); });
+    };
+
     // 数值型设置：内嵌输入框（App 卡片跑在宿主的 iframe 里，window.prompt 被屏蔽，点了没反应）
     // 0 一律表示「不限」：限速 0 = 不限速，并发 0 = 不限个数
     var opt3 = numberRow({
@@ -654,6 +682,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
 
     menu.appendChild(opt1);
     menu.appendChild(opt2);
+    menu.appendChild(optProxy);
     menu.appendChild(opt3);
     menu.appendChild(opt4);
     menu.appendChild(opt5);

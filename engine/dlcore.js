@@ -1282,14 +1282,20 @@ function cmdErrorHint(tail) {
 }
 
 // ── 代理支持（无第三方依赖）──
-// 解析顺序（2026-09-23 修订）：
-//   ① config.json 里 proxy === false          → 直连（显式关闭，不再看系统代理）
-//   ② 白名单命中（config.json 的 noProxy / 环境变量 NO_PROXY）→ 直连
-//   ③ 环境变量 HTTPS_PROXY / HTTP_PROXY
-//   ④ config.json 的 proxy（字符串，指定代理地址）
-//   ⑤ Windows 系统代理（注册表）
-// 修订动机（实测）：原顺序只有 ③④⑤，没有“不走代理”的出口——系统代理一开，所有下载都被迫走它。
-// 国内镜像（hf-mirror 等）直连 26MB/s、经代理 0.75MB/s，相差 30 倍；此前用户只能换工具（curl）下大文件。
+// 解析顺序（2026-09-23 起，2026-09-24 增加模式与自动路由）：
+//   ① 模式 never / config.json 的 proxy === false   → 直连（不再看系统代理）
+//   ② 强制直连命中（directHosts / noProxy / NO_PROXY）→ 直连
+//   ③ 模式 always / config.json 的 proxy 为字符串    → 使用代理
+//   ④ 强制代理命中（proxyHosts）                    → 使用代理
+//   ⑤ 内置域名规则（国内源直连、国外源代理）
+//   ⑥ 未知域名 → 直连探测一次（HEAD，默认 3s）并缓存结果
+// 代理地址来源：config.proxy.url → config.proxy(字符串) → 环境变量 → Windows 注册表（**只读**）
+//
+// 只读纪律（2026-09-24）：App 只**读取**环境，不修改任何系统级设置——不写系统代理、
+// 不启停代理进程、不改防火墙、不申请管理员权限。在别人的机器上尤其如此。
+//
+// 修订动机（实测）：国内镜像（hf-mirror 等）直连 26MB/s、经代理 0.75MB/s，相差 30 倍；
+// 此前只能靠人工把域名填进白名单，否则系统代理一开就被推着走。
 function readUserConfig(dataDir) {
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf-8") || "{}");
@@ -1326,18 +1332,74 @@ export function noProxyList(dataDir) {
   return list;
 }
 
-export function resolveProxy(dataDir, targetUrl = "") {
+// 内置规则：国内源 / 镜像默认直连。走代理反而慢（实测 hf-mirror 直连 26MB/s、经代理 0.75MB/s）。
+// 规则保持克制：宁可少列，交给 ⑥ 的探测兜底，以免误伤新的国外源。
+export const CN_DIRECT = [
+  "*.cn",
+  "hf-mirror.com",
+  "mirrors.tuna.tsinghua.edu.cn",
+  "mirrors.aliyun.com",
+  "mirrors.cloud.tencent.com",
+  "mirrors.ustc.edu.cn",
+  "mirrors.huaweicloud.com",
+  "repo.huaweicloud.com",
+  "registry.npmmirror.com",
+  "registry.npm.taobao.org",
+  "gitee.com",
+  "*.aliyuncs.com",
+  "*.myqcloud.com",
+  "*.qiniu.com",
+  "*.bcebos.com",
+];
+
+// 内置规则：国外源默认走代理。同样保持克制，只列“直连大概率不通”的。
+export const FOREIGN_PROXY = [
+  "github.com",
+  "githubusercontent.com",
+  "huggingface.co",
+  "pypi.org",
+  "pythonhosted.org",
+  "npmjs.org",
+  "npmjs.com",
+  "crates.io",
+  "nodejs.org",
+  "golang.org",
+  "proxy.golang.org",
+  "download.pytorch.org",
+  "developer.download.nvidia.com",
+  "docker.com",
+  "docker.io",
+];
+
+// 兼容三种写法：
+//   proxy: false                      → never（显式直连）
+//   proxy: "http://127.0.0.1:7890"     → always + 指定地址
+//   proxy: { mode, url, directHosts, proxyHosts, probeTimeoutMs } → 新结构
+export function readProxyConfig(dataDir) {
   const cfg = readUserConfig(dataDir);
-  if (cfg.proxy === false) return ""; // ① 显式直连
-  if (targetUrl) {                    // ② 白名单直连
-    let host = "";
-    try { host = new URL(targetUrl).hostname; } catch { host = ""; }
-    if (host && noProxyList(dataDir).some((e) => hostMatchesNoProxy(host, e))) return "";
+  const p = cfg.proxy;
+  const out = { mode: "auto", url: "", directHosts: [], proxyHosts: [], probeTimeoutMs: 3000 };
+  if (p === false) { out.mode = "never"; return out; }
+  if (typeof p === "string" && p.trim()) { out.mode = "always"; out.url = p.trim(); return out; }
+  if (p && typeof p === "object") {
+    if (["auto", "always", "never"].includes(p.mode)) out.mode = p.mode;
+    if (typeof p.url === "string") out.url = p.url.trim();
+    if (Array.isArray(p.directHosts)) out.directHosts = p.directHosts.filter(Boolean).map(String);
+    if (Array.isArray(p.proxyHosts)) out.proxyHosts = p.proxyHosts.filter(Boolean).map(String);
+    if (Number.isFinite(p.probeTimeoutMs) && p.probeTimeoutMs > 0) out.probeTimeoutMs = Math.min(p.probeTimeoutMs, 10000);
   }
+  return out;
+}
+
+// 代理地址来源（按优先级）：显式参数 → config.proxy.url/字符串 → 环境变量 → Windows 注册表（只读）
+export function resolveProxyUrl(dataDir, explicit = "") {
+  if (explicit) return explicit;
+  const p = readUserConfig(dataDir).proxy;
+  if (typeof p === "string" && p.trim()) return p.trim();
+  if (p && typeof p === "object" && typeof p.url === "string" && p.url.trim()) return p.url.trim();
   const envP = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
-  if (envP) return envP;              // ③
-  if (cfg.proxy) return String(cfg.proxy); // ④
-  try {                               // ⑤
+  if (envP) return envP;
+  try {
     const out = spawnSync(
       "reg",
       ["query", 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', "/v", "ProxyServer"],
@@ -1345,12 +1407,56 @@ export function resolveProxy(dataDir, targetUrl = "") {
     );
     const m = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(out.stdout || "");
     if (m && m[1].trim()) {
-      const p = m[1].trim();
-      if (p.startsWith("http://") || p.startsWith("https://")) return p;
-      return "http://" + p;
+      const v = m[1].trim();
+      if (v.startsWith("http://") || v.startsWith("https://")) return v;
+      return "http://" + v;
     }
-  } catch { /* 读注册表失败则直连 */ }
+  } catch { /* 读不到就算没有 */ }
   return "";
+}
+
+// 直连探测：只在「未知域名 + auto 模式」时发生，结果按域名缓存在进程内存里。
+// 用 curl 发一个 HEAD；退出码 0 视为直连可用。**只读探测，不修改环境。**
+const probeCache = new Map();
+export function probeDirect(host, timeoutMs = 3000) {
+  const h = String(host || "").toLowerCase();
+  if (!h) return false;
+  if (probeCache.has(h)) return probeCache.get(h);
+  let ok = false;
+  try {
+    const sec = String(Math.max(1, Math.round(timeoutMs / 1000)));
+    const r = spawnSync(
+      "curl",
+      ["-sI", "--max-time", sec, "-o", process.platform === "win32" ? "NUL" : "/dev/null", `https://${h}/`],
+      { windowsHide: true, timeout: timeoutMs + 2000 }
+    );
+    ok = !!(r && r.status === 0);
+  } catch { ok = false; }
+  probeCache.set(h, ok);
+  return ok;
+}
+
+export function resolveProxy(dataDir, targetUrl = "") {
+  const rc = readProxyConfig(dataDir);
+  if (rc.mode === "never") return "";                 // ① 显式直连
+  const url = resolveProxyUrl(dataDir, rc.url);
+  if (!url) return "";                                 // 没有可用代理地址 → 只能直连
+
+  let host = "";
+  if (targetUrl) { try { host = new URL(targetUrl).hostname.toLowerCase(); } catch { host = ""; } }
+  if (!host) return url;                               // 不知道目标 → 保守走代理
+
+  // ② 强制直连
+  if (rc.directHosts.some((e) => hostMatchesNoProxy(host, e))) return "";
+  if (noProxyList(dataDir).some((e) => hostMatchesNoProxy(host, e))) return "";
+  if (rc.mode === "always") return url;               // ③
+  // ④ 强制代理
+  if (rc.proxyHosts.some((e) => hostMatchesNoProxy(host, e))) return url;
+  // ⑤ 内置规则（国外先判，避免被 "*.cn" 之类误伤）
+  if (FOREIGN_PROXY.some((e) => hostMatchesNoProxy(host, e))) return url;
+  if (CN_DIRECT.some((e) => hostMatchesNoProxy(host, e))) return "";
+  // ⑥ 未知域名 → 直连探测一次
+  return probeDirect(host, rc.probeTimeoutMs) ? "" : url;
 }
 
 // 小响应缓冲：Content-Length < 4KB 时读完整 body，用于检测文本重定向

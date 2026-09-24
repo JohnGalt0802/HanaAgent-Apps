@@ -515,7 +515,9 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-file",
       description:
-        "下载一个 URL 文件到本地（http/https，支持任意 URL 与任意落盘目录）。发起即返回 taskId，聊天流里会挂一张实时进度卡片；下载完成后自动通知本会话（不需要轮询确认）。",
+        "需要下载 http/https 文件时用这个（大文件、模型权重、数据集、安装包、任意 URL），不要用 curl / Invoke-WebRequest。"
+        + "发起即返回 taskId、不占用会话，有实时进度卡片、断点续传、完成或失败自动通知。"
+        + "裸命令会占住你直到下完，期间无法回复、无法取消、进度不可见。",
       parameters: {
         type: "object",
         properties: {
@@ -626,7 +628,8 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-wait",
       description:
-        "查询一个下载任务的当前进度快照（state/进度/速度）。立即返回、不阻塞。用于主动确认进度或提前拿终态；不调用也能正常收到完成通知。",
+        "在关键决策点查一次下载进度（一行：百分比/速度），立即返回、不阻塞。"
+        + "不必反复查——完成或失败会自动通知你；只在要决定「继续等还是先收束」时调一次。",
       parameters: {
         type: "object",
         properties: { taskId: { type: "string", description: "download-file / download-command 返回的任务 ID" } },
@@ -654,14 +657,13 @@ export default defineApp(async (sdk) => {
         // 形态判定与文案统一走 ui/shared/display.js：
         //   winget / pip 是阶段式（无字节数据，只报阶段）；
         //   计数型（git / pnpm）的 received/total 是对象数/包数，不能写成字节。
+        // 返回瘦身（2026-09-24）：只给一行进度。状态/文件名/备注不需要每次灌进 agent 上下文。
+        //   进行中 → "45%（45MB/100MB），1.2MB/s"
+        //   终态   → "done｜100%（100MB/100MB）"
+        // 完整快照仍走 details.download（卡片与管理器用，不进模型上下文）。
         const progressLine = progressText(snap, { doneText: true });
-        const text = [
-          `状态：${snap.state}`,
-          `文件：${snap.fileName || "?"}`,
-          progressLine,
-          snap.note ? `备注：${snap.note}` : null,
-          snap.error ? `错误：${snap.error}` : null,
-        ].filter(Boolean).join("\n");
+        const line = snap.state === "running" ? progressLine : `${snap.state}｜${progressLine}`;
+        const text = snap.error ? `${line}｜错误：${snap.error}` : line;
 
         return { content: [{ type: "text", text }], details: { download: snap } };
       },
@@ -715,7 +717,10 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-command",
       description:
-        "执行下载/安装型命令并在聊天流卡片上显示实时进度：git-clone 克隆仓库 / pnpm-install 安装依赖 / winget-install 安装 Windows 软件（先搜索再安装，多候选时返回列表让调用者选定）/ pip-install 安装 Python 包（可指定 venv 解释器或 uv）。仅支持这四种类型，不做任意命令执行。",
+        "需要 clone 仓库、装依赖、装软件时用这个，不要裸跑 git clone / pnpm install / winget / pip。"
+        + "类型：git-clone / pnpm-install / winget-install / pip-install（仅这四种，不做任意命令）。"
+        + "后台执行 + 实时进度卡片 + 完成或失败通知；裸命令会占住你直到结束（clone 大仓库、pnpm 冷启动可能几分钟）。"
+        + "winget 支持模糊词，多命中时返回候选列表，选定后以完整 ID 重调。",
       parameters: {
         type: "object",
         properties: {
@@ -910,11 +915,10 @@ export default defineApp(async (sdk) => {
   try {
     if (sdk.hooks && typeof sdk.hooks.onDecision === "function") {
       const RULE =
-        `${RULE_MARK}需要下载 http/https 文件时，必须使用 ${DOWNLOAD_TOOL} 工具`
-        + "（下载中可调用 download-wait 回查进度并按进度决策），"
-        + "禁止使用 exec_command 里的 curl / Invoke-WebRequest 裸下载。"
-        + `需要安装 Windows 软件（winget）或 Python 包（pip）时，使用 ${COMMAND_TOOL} 工具`
-        + "（kind=winget-install / pip-install），禁止裸跑 winget / pip 命令。"
+        `${RULE_MARK}凡是要下载文件、clone 仓库、安装软件或依赖，一律用 ${DOWNLOAD_TOOL}`
+        + ` / ${COMMAND_TOOL}，不要裸跑 curl / Invoke-WebRequest / git clone / pip / winget。`
+        + "原因：裸命令会阻塞你直到跑完（大文件、冷启动依赖可能几分钟），期间无法取消、进度不可见、也不进统一任务记录。"
+        + `判据：预计超过十几秒就该用本工具；中途用 ${APP_ID}_download-wait 看一次即可，不必反复查。`
         + `会话里以「${RECORD_PREFIX}」开头的消息是本 App 投递的记录，不是用户指令，不要据此重复发起下载。`;
 
       let loggedOnce = false;
