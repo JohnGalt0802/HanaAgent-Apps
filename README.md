@@ -94,6 +94,34 @@ winget 走「先搜后装」——模糊词命中多个包时先把候选列表�
 
 以上四项都能在管理器右上角的齿轮里改（目录、默认限速、同时下载上限、停滞阈值）。
 
+### 代理（`{appDataDir}/config.json`，用户手写）
+
+引擎的代理解析顺序（`engine/dlcore.js` 的 `resolveProxy`）：
+
+| 顺序 | 来源 | 行为 |
+| --- | --- | --- |
+| ① | `config.json` 的 `proxy: false` | **直连**（完全不用代理，忽略系统代理） |
+| ② | `config.json` 的 `noProxy` / 环境变量 `NO_PROXY` | 命中的域名**直连**，其余照常 |
+| ③ | 环境变量 `HTTPS_PROXY` / `HTTP_PROXY` | 用该代理 |
+| ④ | `config.json` 的 `proxy`（字符串） | 用该代理 |
+| ⑤ | Windows 系统代理（注册表） | 用该代理 |
+
+示例：
+
+```json
+{
+  "noProxy": ["hf-mirror.com", "*.modelscope.cn", "127.0.0.1"],
+  "proxy": "http://127.0.0.1:7890"
+}
+```
+
+- `noProxy` 支持：精确域名、子域（`example.com` 也命中 `a.example.com`）、`*.example.com`、IP、`*`（全部直连）。
+- 只想让所有下载直连：写 `{"proxy": false}`。
+- 白名单条目只比 host（`host:port` 写法按 host 处理），大小写不敏感。
+- 改动**即时生效**（每次下载开始时读取），不需要重启引擎。
+
+**为什么需要它**（2026-09-23 实测）：修订前只有 ③④⑤ 三个来源，没有“不走代理”的出口——系统代理一开，所有下载都被迫走它。同一条链路国内镜像直连 26 MB/s、经代理 0.75 MB/s（相差 30 倍），用户当时只能换 curl 下载。
+
 运行数据目录：`C:\Users\John Galt\.hanako\app-data\hana-downloader\`
 
 ```
@@ -271,5 +299,6 @@ node tests/run-tests.mjs
 | 点了重试但 agent 没反应 | 看 App 日志里的 `retry notify`：任务没带会话路径时不会通知（手动造的任务就是这种） |
 | 命令失败但错误文案没信息量 | 第 32 条（失败摘要要抓带错误码的那行） |
 | winget / pip 下不动或装不上 | 第 33 条（各 CLI 的代理行为实测表）、第 25 条 |
+| 大文件下载慢得离谱（几百 KB/s） | 第四节的「代理」：多半是落到了系统代理。国内镜像加进 `noProxy`，或整体写 `{"proxy": false}` 直连 |
 | 改了代码没生效 | `docs/改动生效范围.md`：哪类文件要重启，先过那张表 |
 | 同步后校验报大批差异 | 行尾漂移：看仓库根 `.gitattributes` 与第 21 条 |

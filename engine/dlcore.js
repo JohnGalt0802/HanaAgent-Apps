@@ -320,7 +320,7 @@ class TaskManager {
       // 本地回环目标永不走代理：回环流量经代理隧道既慢又不稳定（实测被中途掐断）
       const isLoopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(targetUrl.hostname)
         || /^127\./.test(targetUrl.hostname);
-      const proxy = isLoopback ? "" : resolveProxy(this.dataDir);
+      const proxy = isLoopback ? "" : resolveProxy(this.dataDir, task.url);
       const mod = targetUrl.protocol === "https:" ? https : http;
 
       // 请求 + 重定向（3xx 与文本重定向，如 npmmirror 的 "Redirecting to ..."）
@@ -628,9 +628,14 @@ class TaskManager {
       if (proxy) {
         childEnv.HTTP_PROXY = proxy; childEnv.HTTPS_PROXY = proxy;
         childEnv.http_proxy = proxy; childEnv.https_proxy = proxy;
-        childEnv.NO_PROXY = "localhost,127.0.0.1,::1";
-        childEnv.no_proxy = childEnv.NO_PROXY;
+      } else {
+        // proxy:false（显式直连）时子进程也不该继承代理：清掉可能存在的继承值
+        delete childEnv.HTTP_PROXY; delete childEnv.HTTPS_PROXY;
+        delete childEnv.http_proxy; delete childEnv.https_proxy;
       }
+      // 白名单（config.json 的 noProxy / NO_PROXY）也要带给子进程，否则 pnpm 仍会把它们走代理
+      const no = ["localhost", "127.0.0.1", "::1", ...noProxyList(this.dataDir)].join(",");
+      childEnv.NO_PROXY = no; childEnv.no_proxy = no;
     }
     let child;
     try {
@@ -1277,15 +1282,62 @@ function cmdErrorHint(tail) {
 }
 
 // ── 代理支持（无第三方依赖）──
-// 优先级：环境变量 HTTPS_PROXY/HTTP_PROXY > 插件 config.json 的 proxy 字段 > Windows 系统代理（注册表）
-function resolveProxy(dataDir) {
-  const envP = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
-  if (envP) return envP;
+// 解析顺序（2026-09-23 修订）：
+//   ① config.json 里 proxy === false          → 直连（显式关闭，不再看系统代理）
+//   ② 白名单命中（config.json 的 noProxy / 环境变量 NO_PROXY）→ 直连
+//   ③ 环境变量 HTTPS_PROXY / HTTP_PROXY
+//   ④ config.json 的 proxy（字符串，指定代理地址）
+//   ⑤ Windows 系统代理（注册表）
+// 修订动机（实测）：原顺序只有 ③④⑤，没有“不走代理”的出口——系统代理一开，所有下载都被迫走它。
+// 国内镜像（hf-mirror 等）直连 26MB/s、经代理 0.75MB/s，相差 30 倍；此前用户只能换工具（curl）下大文件。
+function readUserConfig(dataDir) {
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, "config.json"), "utf-8") || "{}");
-    if (cfg && cfg.proxy) return String(cfg.proxy);
-  } catch { /* 无配置则跳过 */ }
-  try {
+    return cfg && typeof cfg === "object" ? cfg : {};
+  } catch { return {}; } // 无配置 / 解析失败 → 空配置（保持旧行为）
+}
+
+// 白名单条目匹配：精确域名、子域（example.com 也命中 a.example.com）、“*.example.com” 写法、IP，
+// 以及 “*”（全部直连）。带端口条目（host:port）按 host 比较。
+export function hostMatchesNoProxy(host, entry) {
+  const h = String(host || "").trim().toLowerCase();
+  const raw = String(entry || "").trim().toLowerCase();
+  if (!h || !raw) return false;
+  if (raw === "*") return true;
+  const e = raw.replace(/^\*\./, "").replace(/^\./, "").replace(/:\d+$/, "");
+  if (!e) return false;
+  return h === e || h.endsWith("." + e);
+}
+
+// 白名单来源：config.json 的 noProxy（数组或逗号串）+ 环境变量 NO_PROXY / no_proxy
+export function noProxyList(dataDir) {
+  const cfg = readUserConfig(dataDir);
+  const list = [];
+  const push = (v) => {
+    for (const x of String(v == null ? "" : v).split(",")) {
+      const t = x.trim();
+      if (t) list.push(t);
+    }
+  };
+  if (Array.isArray(cfg.noProxy)) push(cfg.noProxy.join(","));
+  else if (typeof cfg.noProxy === "string") push(cfg.noProxy);
+  if (process.env.NO_PROXY) push(process.env.NO_PROXY);
+  if (process.env.no_proxy) push(process.env.no_proxy);
+  return list;
+}
+
+export function resolveProxy(dataDir, targetUrl = "") {
+  const cfg = readUserConfig(dataDir);
+  if (cfg.proxy === false) return ""; // ① 显式直连
+  if (targetUrl) {                    // ② 白名单直连
+    let host = "";
+    try { host = new URL(targetUrl).hostname; } catch { host = ""; }
+    if (host && noProxyList(dataDir).some((e) => hostMatchesNoProxy(host, e))) return "";
+  }
+  const envP = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
+  if (envP) return envP;              // ③
+  if (cfg.proxy) return String(cfg.proxy); // ④
+  try {                               // ⑤
     const out = spawnSync(
       "reg",
       ["query", 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', "/v", "ProxyServer"],
