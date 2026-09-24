@@ -517,7 +517,8 @@ export default defineApp(async (sdk) => {
       description:
         "需要下载 http/https 文件时用这个（大文件、模型权重、数据集、安装包、任意 URL），不要用 curl / Invoke-WebRequest。"
         + "发起即返回 taskId、不占用会话，有实时进度卡片、断点续传、完成或失败自动通知。"
-        + "裸命令会占住你直到下完，期间无法回复、无法取消、进度不可见。",
+        + "裸命令会占住你直到下完，期间无法回复、无法取消、进度不可见。"
+        + "要主动查进度用 download-wait；返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里（拿它去 wait_for_tasks 会返回「未找到任务」）。",
       parameters: {
         type: "object",
         properties: {
@@ -720,7 +721,8 @@ export default defineApp(async (sdk) => {
         "需要 clone 仓库、装依赖、装软件时用这个，不要裸跑 git clone / pnpm install / winget / pip。"
         + "类型：git-clone / pnpm-install / winget-install / pip-install（仅这四种，不做任意命令）。"
         + "后台执行 + 实时进度卡片 + 完成或失败通知；裸命令会占住你直到结束（clone 大仓库、pnpm 冷启动可能几分钟）。"
-        + "winget 支持模糊词，多命中时返回候选列表，选定后以完整 ID 重调。",
+        + "winget 支持模糊词，多命中时返回候选列表，选定后以完整 ID 重调。"
+        + "要主动查进度用 download-wait；返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里。",
       parameters: {
         type: "object",
         properties: {
