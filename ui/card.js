@@ -481,34 +481,15 @@ function renderHint(msg) {
 // ── 启动 ──
 window.addEventListener("load", () => setTimeout(reportSize, 60));
 
-// 尺寸诊断：把当前 iframe 宽度与宿主信封上报到卡片活动仓（hana.track，不进会话、不唤醒）。
-// 用途：在宿主侧确认聊天流卡实际拿到多宽（页面无法直接决定宽度，只能上报）。
-setTimeout(() => {
-  try {
-    let env = null;
-    try { env = hana.envelope?.getSnapshot?.() || null; } catch (e) { env = null; }
-    const q = (sel) => { try { const el = document.querySelector(sel); return el ? el.offsetHeight : null; } catch (e) { return null; } };
-    const cs = (sel) => { try { const s = getComputedStyle(sel ? document.querySelector(sel) : document.body); return { lh: s.lineHeight, fs: s.fontSize, pad: s.padding, mt: s.marginTop, mb: s.marginBottom }; } catch (e) { return null; } };
-    hana.track?.("diag", {
-      w: window.innerWidth,
-      h: window.innerHeight,
-      dpr: window.devicePixelRatio,
-      envW: env?.width || null,
-      envH: env?.height || null,
-      want: CARD_WIDTH,
-      // 高度拆解（2026-09-14 压薄排查用）
-      bodyH: document.body?.offsetHeight ?? null,
-      rootH: q("#dl-root"),
-      dlH: q(".dl"),
-      rowH: q(".dl-row"),
-      row2H: q(".dl-row2"),
-      trackH: q(".dl-track"),
-      pctH: q(".dl-pct"),
-      bodyCs: cs(null),
-      rowCs: cs(".dl-row"),
-    });
-  } catch (e) { /* 诊断失败不影响主流程 */ }
-}, 1200);
+// 尺寸诊断已于 2026-09-25 移除。
+// 原实现在挂载后 1.2s 调 hana.track("diag", {...}) 上报 iframe 宽度与信封尺寸，
+// 用于排查「撑满聊天流」问题（见 docs/踩坑记录.md 第 38 条）。该问题已定性，
+// 而这段代码在宿主 0.1023.1 上会报两个错：
+//   ① events/track cardInstanceId must be a host-minted app card id.
+//      —— 聊天流卡的 id 是 stableCardId() 自算的，新宿主只认宿主铸造的 id；
+//   ② Plugin host request timed out: hana.track.
+//      —— 多卡同时挂载时成批发请求，正是第 38 条里「插件通道堵」的同期证据，
+//         留着它等于自己给通道加负担。
 
 (async () => {
   await bindTask();

@@ -44,34 +44,11 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
 
   try { hana.ready(); } catch (e4) { /* ready 失败不阻塞渲染 */ }
 
-  // ── 配色诊断（2026-09-14）──
-  // 用途：确认管理器底色与宿主原生卡片是否一致。
-  // 关键点：宿主主题 CSS 并不会注入 iframe，所以 var(--bg-card, …) 实际走兜底值；
-  // 这里把“兜底值 vs 真实计算值 vs 变量是否定义”一次性报出来。
-  setTimeout(function () {
-    try {
-      var root = document.getElementById("dl-root");
-      var rootBg = root ? getComputedStyle(root).backgroundColor : null;
-      var bodyBg = getComputedStyle(document.body).backgroundColor;
-      // 探针：用一个隐藏元素读 --bg-card，未定义则得到 #000
-      var probe = document.createElement("div");
-      probe.style.cssText = "position:absolute;visibility:hidden;background:var(--bg-card,#000)";
-      document.body.appendChild(probe);
-      var bgCard = getComputedStyle(probe).backgroundColor;
-      probe.remove();
-      var mgrBg = getComputedStyle(document.documentElement).getPropertyValue("--mgr-bg").trim();
-      var themeSnap = null;
-      try { themeSnap = hana.theme?.getSnapshot?.() || null; } catch (e5) { themeSnap = null; }
-      hana.track?.("diag", {
-        rootBg: rootBg,
-        bodyBg: bodyBg,
-        bgCardVar: bgCard,
-        mgrBgVar: mgrBg || null,
-        dark: document.body.classList.contains("t-dark"),
-        theme: themeSnap ? JSON.stringify(themeSnap) : null,
-      });
-    } catch (e6) { /* 诊断失败不影响主流程 */ }
-  }, 1200);
+  // 配色诊断已于 2026-09-25 移除：原实现在挂载后 1.2s 调 hana.track("diag", {...})
+  // 上报底色与主题快照。宿主 0.1023.1 对该通道加了校验（cardInstanceId 必须是宿主
+  // 铸造的，管理器是宿主原生卡、拿不到自算 id），调用会报
+  //   Uncaught HanaPluginError: events/track cardInstanceId must be a host-minted app card id.
+  // 且多卡同时挂载时会成批超时（见 docs/踩坑记录.md 第 38 条），收益为零、只有害处。
 
   // 阶段文案与计数单位来自 ui/shared/display.js（唯一来源），这里不再各存一份。
 
