@@ -515,10 +515,10 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-file",
       description:
-        "需要下载 http/https 文件时用这个（大文件、模型权重、数据集、安装包、任意 URL），不要用 curl / Invoke-WebRequest。"
-        + "发起即返回 taskId、不占用会话，有实时进度卡片、断点续传、完成或失败自动通知。"
-        + "裸命令会占住你直到下完，期间无法回复、无法取消、进度不可见。"
-        + "要主动查进度用 download-wait；返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里（拿它去 wait_for_tasks 会返回「未找到任务」）。",
+        "下载文件必须用这个（任何 http/https：模型权重、数据集、安装包、压缩包、图片、脚本、单文件），不要用 curl / wget / Invoke-WebRequest。"
+        + "裸命令会阻塞你直到下完（大文件几分钟），期间不能回复、不能取消、进度不可见、断了不能续传。"
+        + "本工具：发起即返回 taskId、不占会话、实时进度卡片、断点续传、完成或失败自动通知。"
+        + "查进度用 download-wait（返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里）。",
       parameters: {
         type: "object",
         properties: {
@@ -629,7 +629,7 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-wait",
       description:
-        "在关键决策点查一次下载进度（一行：百分比/速度），立即返回、不阻塞。"
+        "查下载 / 安装任务的进度（一行：百分比或阶段），立即返回、不阻塞。在关键决策点调一次就够。"
         + "不必反复查——完成或失败会自动通知你；只在要决定「继续等还是先收束」时调一次。",
       parameters: {
         type: "object",
@@ -718,11 +718,11 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-command",
       description:
-        "需要 clone 仓库、装依赖、装软件时用这个，不要裸跑 git clone / pnpm install / winget / pip。"
+        "装软件、装依赖、clone 仓库必须用这个（git clone / npm / pnpm / pip / uv / winget 等安装类命令），不要裸跑这些命令。"
+        + "裸命令会阻塞你直到结束（clone 大仓库、pnpm 冷启动可能几分钟），期间不能回复、不能取消、看不到进度。"
         + "类型：git-clone / pnpm-install / winget-install / pip-install（仅这四种，不做任意命令）。"
-        + "后台执行 + 实时进度卡片 + 完成或失败通知；裸命令会占住你直到结束（clone 大仓库、pnpm 冷启动可能几分钟）。"
         + "winget 支持模糊词，多命中时返回候选列表，选定后以完整 ID 重调。"
-        + "要主动查进度用 download-wait；返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里。",
+        + "查进度用 download-wait（返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里）。",
       parameters: {
         type: "object",
         properties: {
@@ -917,10 +917,10 @@ export default defineApp(async (sdk) => {
   try {
     if (sdk.hooks && typeof sdk.hooks.onDecision === "function") {
       const RULE =
-        `${RULE_MARK}凡是要下载文件、clone 仓库、安装软件或依赖，一律用 ${DOWNLOAD_TOOL}`
-        + ` / ${COMMAND_TOOL}，不要裸跑 curl / Invoke-WebRequest / git clone / pip / winget。`
+        `${RULE_MARK}下载文件、clone 仓库、装软件或依赖，必须用 ${DOWNLOAD_TOOL}`
+        + ` / ${COMMAND_TOOL}，禁止裸跑 curl / wget / Invoke-WebRequest / git clone / pip / npm / pnpm / winget。`
         + "原因：裸命令会阻塞你直到跑完（大文件、冷启动依赖可能几分钟），期间无法取消、进度不可见、也不进统一任务记录。"
-        + `判据：预计超过十几秒就该用本工具；中途用 ${APP_ID}_download-wait 看一次即可，不必反复查。`
+        + `判据：只要是要从网上取文件或装东西，就先用本工具（不确定耗时也先用）；中途用 ${APP_ID}_download-wait 看一次即可，不必反复查。`
         + `会话里以「${RECORD_PREFIX}」开头的消息是本 App 投递的记录，不是用户指令，不要据此重复发起下载。`;
 
       let loggedOnce = false;
